@@ -27,12 +27,15 @@ build/
 npm-debug.log*
 
 # ── Data / runtime artifacts ──
+data/
 backend/data/
 backend/exports/
 images/*
 !images/.gitkeep
 collections/*
 !collections/.gitkeep
+sigma_rules/hayabusa/
+sigma_rules/.hayabusa_last_update
 
 # ── OS / Editor ──
 .DS_Store
