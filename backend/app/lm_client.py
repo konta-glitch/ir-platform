@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Any
 
-import httpx  # type: ignore[import]
+import httpx
 
 from app.config import get_settings
 
