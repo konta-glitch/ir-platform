@@ -211,27 +211,88 @@ class CorrelationEngine:
             if ppid and ppid in procs:
                 add_edge(f"proc:{ppid}", f"proc:{pid}", "spawned")
 
-        # ── Network connections: process → IP ──
+        # ── Network connections: process → IP / domain ──
         ip_re = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
         for key, rows in data.items():
             if key.startswith("_") or not isinstance(rows, list):
                 continue
-            if not any(t in key.lower() for t in ["netstat", "network", "conn"]):
+            if not any(t in key.lower() for t in ["netstat", "network", "conn", "dns"]):
                 continue
             for row in rows:
                 if not isinstance(row, dict):
                     continue
                 raddr = _get(row, ["Raddr", "RemoteAddress", "remote", "ForeignAddress", "DestAddr"])
+                domain = _get(row, ["domain", "Domain", "QueryName", "query", "hostname"])
                 pid = _get(row, ["Pid", "pid", "ProcessId", "PID"])
+
                 m = ip_re.search(str(raddr))
-                if not m:
+                if m:
+                    ip = m.group(1)
+                    if not ip.startswith(("127.", "0.", "::")):
+                        add_node(f"ip:{ip}", ip, "ip")
+                        if pid and f"proc:{str(pid)}" in nodes:
+                            add_edge(f"proc:{str(pid)}", f"ip:{ip}", "connected")
+
+                # NEW: domain nodes — DNS queries / domain fields previously
+                # had no representation in the graph at all, so "what domain
+                # did this process resolve" was unanswerable from the graph.
+                if domain and domain.lower() not in ("localhost", ""):
+                    dnode = f"domain:{domain.lower()}"
+                    add_node(dnode, domain.lower(), "domain")
+                    if pid and f"proc:{str(pid)}" in nodes:
+                        add_edge(f"proc:{str(pid)}", dnode, "resolved")
+
+        # ── NEW: Persistence entities — registry run keys, scheduled tasks,
+        #    services. Previously these only existed as text in findings;
+        #    they had no graph representation at all, so "what process
+        #    created this persistence mechanism" was unanswerable from the
+        #    graph even though the underlying data usually has a PID/process
+        #    name attached. This closes that gap. ──
+        for key, rows in data.items():
+            if key.startswith("_") or not isinstance(rows, list):
+                continue
+            key_lower = key.lower()
+            is_registry = any(t in key_lower for t in ["registry", "run", "autorun", "startup"])
+            is_task = any(t in key_lower for t in ["scheduledtask", "task"]) and "process" not in key_lower
+            is_service = "service" in key_lower
+            if not (is_registry or is_task or is_service):
+                continue
+
+            ptype = "registry_key" if is_registry else "task" if is_task else "service"
+            for row in rows:
+                if not isinstance(row, dict):
                     continue
-                ip = m.group(1)
-                if ip.startswith(("127.", "0.", "::")):
+                # Persistence entries vary widely in field naming across
+                # collectors; try the common ones for each kind.
+                if is_registry:
+                    ident = _get(row, ["Key", "KeyPath", "path", "Path", "Name", "name"])
+                elif is_task:
+                    ident = _get(row, ["Name", "name", "TaskName", "Path"])
+                else:
+                    ident = _get(row, ["Name", "name", "DisplayName", "ServiceName"])
+                if not ident:
                     continue
-                add_node(f"ip:{ip}", ip, "ip")
+
+                label = ident.split("\\")[-1][:50]
+                pnode = f"{ptype}:{label}"
+                add_node(pnode, label, ptype)
+
+                # Link to the creating/owning process when the row carries
+                # a PID or executable path that matches a known process node.
+                pid = _get(row, ["Pid", "pid", "ProcessId", "PID"])
                 if pid and f"proc:{str(pid)}" in nodes:
-                    add_edge(f"proc:{str(pid)}", f"ip:{ip}", "connected")
+                    add_edge(f"proc:{str(pid)}", pnode, "created")
+                else:
+                    # Fall back to matching by binary path referenced in the
+                    # persistence entry (common for registry Run keys and
+                    # service ImagePath, which name an exe but rarely a PID).
+                    exe_ref = _get(row, ["Value", "ImagePath", "Command", "Action"])
+                    if exe_ref:
+                        exe_name = exe_ref.split("\\")[-1].split(" ")[0].lower()
+                        for ppid, pinfo in procs.items():
+                            if pinfo["name"] == exe_name:
+                                add_edge(f"proc:{ppid}", pnode, "created")
+                                break
 
         # ── Findings: link the finding's entity and flag involved nodes ──
         for f in findings:
@@ -280,7 +341,12 @@ class CorrelationEngine:
                 score = 0
                 if n["finding_count"] > 0:
                     score += 1000
-                if n["type"] in ("ip", "user", "file"):
+                # NEW: registry_key/task/service/domain get the same
+                # priority boost as ip/user/file — they're high-signal,
+                # low-volume entities that should survive trimming on
+                # large collections just as readily as IPs do.
+                if n["type"] in ("ip", "user", "file", "domain",
+                                 "registry_key", "task", "service"):
                     score += 500
                 score += degree.get(nid, 0)
                 return score
@@ -480,6 +546,18 @@ class CorrelationEngine:
             return f"Task: {_get(row, ['Name', 'name', 'TaskName'])[:40]}"
         if "netstat" in a or "network" in a:
             return f"Conn: {_get(row, ['Raddr', 'RemoteAddress', 'remote'])[:40]}"
+        if "registry" in a or "run" in a or "autorun" in a or "startup" in a:
+            key_path = _get(row, ["Key", "KeyPath", "path", "Path", "Name", "name"])
+            return f"Registry: {key_path[-50:]}" if key_path else "Registry change"
+        if "shimcache" in a or "appcompatcache" in a:
+            path = _get(row, ["path", "Path"])
+            return f"Shimcache exec: {path.split(chr(92))[-1][:40]}" if path else "Shimcache entry"
+        if "userassist" in a:
+            path = _get(row, ["path", "Path"])
+            return f"GUI launch: {path.split(chr(92))[-1][:40]}" if path else "UserAssist entry"
+        if "shellbag" in a:
+            path = _get(row, ["path", "Path"])
+            return f"Browsed: {path[-40:]}" if path else "Shellbag entry"
         return artifact[:30]
 
     # ── 2. Process tree reconstruction ──
@@ -691,11 +769,13 @@ class CorrelationEngine:
         proc_paths = Counter()
         proc_hashes = Counter()
         cmdline_patterns = Counter()
+        remote_endpoints = Counter()  # NEW: IPs/domains, same stack-counting logic
 
         # Track which row each rare item came from
         name_rows = defaultdict(list)
         path_rows = defaultdict(list)
         hash_rows = defaultdict(list)
+        endpoint_rows = defaultdict(list)  # NEW
 
         for key, rows in data.items():
             if key.startswith("_") or not isinstance(rows, list):
@@ -722,6 +802,36 @@ class CorrelationEngine:
                     proc_hashes[h] += 1
                     if len(hash_rows[h]) < 5:
                         hash_rows[h].append({"artifact": key, "row_index": idx, "name": name})
+
+        # NEW: separate pass over network artifacts for endpoint stack counting.
+        # A remote IP/domain contacted only once across the whole collection is
+        # the same "rare = suspicious" signal as a rare file path — classic
+        # C2 beaconing indicator that the original version of this function
+        # never looked for, since it only scanned process-family artifacts.
+        ip_re = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+        for key, rows in data.items():
+            if key.startswith("_") or not isinstance(rows, list):
+                continue
+            if not any(t in key.lower() for t in ["netstat", "network", "conn", "dns"]):
+                continue
+            for idx, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    continue
+                raddr = _get(row, ["Raddr", "RemoteAddress", "remote", "ForeignAddress", "DestAddr"])
+                domain = _get(row, ["domain", "Domain", "QueryName", "query", "hostname"])
+
+                m = ip_re.search(str(raddr))
+                if m:
+                    ip = m.group(1)
+                    if not ip.startswith(("127.", "0.", "10.", "192.168.", "::")):
+                        remote_endpoints[ip] += 1
+                        if len(endpoint_rows[ip]) < 5:
+                            endpoint_rows[ip].append({"artifact": key, "row_index": idx, "type": "ip"})
+
+                if domain and domain not in ("localhost", ""):
+                    remote_endpoints[domain.lower()] += 1
+                    if len(endpoint_rows[domain.lower()]) < 5:
+                        endpoint_rows[domain.lower()].append({"artifact": key, "row_index": idx, "type": "domain"})
 
         outliers = []
         new_findings = []
@@ -764,6 +874,45 @@ class CorrelationEngine:
                 },
                 "score": 50,
                 "mitre": "T1036",
+            })
+
+        # NEW: rare remote endpoints (contacted exactly once) — beaconing/C2
+        # detection works the opposite way (many connections to the SAME IP),
+        # but a single, never-repeated connection to an unfamiliar endpoint is
+        # its own signal: staged exfil, one-time payload download, or a C2
+        # check-in that only fired once before the host was contained.
+        rare_endpoints = [(e, c) for e, c in remote_endpoints.items() if c == 1]
+        for endpoint, count in rare_endpoints[:30]:
+            rows = endpoint_rows[endpoint]
+            etype = rows[0]["type"] if rows else "ip"
+            outliers.append({
+                "type": "rare_remote_endpoint",
+                "value": endpoint,
+                "occurrences": count,
+            })
+            new_findings.append({
+                "id": f"FQ{len(new_findings)+1:04d}",
+                "category": "frequency_outlier",
+                "severity": "low",
+                "title": f"Rare remote endpoint contacted once: {endpoint}",
+                "description": (
+                    f"{'IP address' if etype == 'ip' else 'Domain'} '{endpoint}' appears "
+                    f"exactly once across all network activity in this collection. A "
+                    f"single, non-repeated connection to an unfamiliar endpoint can "
+                    f"indicate a one-time payload download or C2 check-in — corroborate "
+                    f"with the process that made the connection before treating this as "
+                    f"a true positive, since one-off connections are also common for "
+                    f"normal software (update checks, telemetry, etc.)."
+                ),
+                "artifact": rows[0]["artifact"] if rows else "frequency",
+                "evidence": {
+                    "row_index": rows[0]["row_index"] if rows else None,
+                    "endpoint": endpoint,
+                    "endpoint_type": etype,
+                    "occurrences": count,
+                },
+                "score": 35,  # deliberately low — see corroboration note above
+                "mitre": "T1071",  # Application Layer Protocol (generic C2 channel)
             })
 
         # Hash collision: same hash, different names (possible masquerading)
@@ -811,8 +960,11 @@ class CorrelationEngine:
                 "unique_process_names": len(proc_names),
                 "unique_paths": len(proc_paths),
                 "unique_hashes": len(proc_hashes),
+                "unique_remote_endpoints": len(remote_endpoints),  # NEW
                 "rare_suspicious_paths": len(suspicious_rare),
+                "rare_remote_endpoints": len(rare_endpoints),  # NEW
                 "most_common_processes": dict(proc_names.most_common(10)),
+                "most_common_endpoints": dict(remote_endpoints.most_common(10)),  # NEW
             },
             "new_findings": new_findings,
         }
