@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Any
 
-import httpx
+import httpx  # type: ignore[import]
 
 from app.config import get_settings
 
@@ -113,12 +113,37 @@ class LMStudioClient:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(self._chat_url(), json=payload)
 
-                if resp.status_code == 400 and shrink > 0.25:
-                    logger.warning(
-                        f"LM Studio 400 (input too long, attempt {attempt+1}). "
-                        f"Retrying with shorter input..."
+                if resp.status_code == 400:
+                    # Read the real error instead of assuming "input too long" —
+                    # LM Studio also returns 400 for "model not found", malformed
+                    # tool schemas, etc. Blindly truncating on every 400 hides
+                    # those errors behind a misleading retry loop.
+                    try:
+                        body = resp.json()
+                        err_msg = body.get("error", {}).get("message", "") if isinstance(
+                            body.get("error"), dict
+                        ) else str(body.get("error", body))
+                    except Exception:
+                        err_msg = resp.text[:300]
+
+                    context_related = any(
+                        kw in err_msg.lower()
+                        for kw in ("context", "token", "too long", "maximum length")
                     )
-                    continue
+
+                    if context_related and shrink > 0.25:
+                        logger.warning(
+                            f"LM Studio 400 (context length, attempt {attempt+1}): "
+                            f"{err_msg}. Retrying with shorter input..."
+                        )
+                        continue
+
+                    # Not a context-length issue (or we're out of retries) —
+                    # surface the real reason immediately.
+                    logger.error(
+                        f"LM Studio 400 — not a context-length issue, won't retry blindly: "
+                        f"{err_msg}"
+                    )
 
                 resp.raise_for_status()
                 result = resp.json()
