@@ -1,0 +1,46 @@
+# ── Environment / secrets ──
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+ENV/
+*.sqlite3
+*.db
+
+# ── Node / frontend ──
+node_modules/
+dist/
+build/
+.vite/
+*.log
+npm-debug.log*
+
+# ── Data / runtime artifacts ──
+backend/data/
+backend/exports/
+images/*
+!images/.gitkeep
+collections/*
+!collections/.gitkeep
+
+# ── OS / Editor ──
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+
+# ── Docker ──
+*.pid
