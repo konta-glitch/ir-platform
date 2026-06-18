@@ -156,24 +156,41 @@ class PersistencePlugin(AnalyzerPlugin):
 
 class FileSystemPlugin(AnalyzerPlugin):
     name    = "filesystem_plugin"
-    version = "1.0.0"
+    version = "1.1.0"
 
     _KEYS = {"filesystem", "files", "file_list", "recent_files", "prefetch",
-             "Prefetch", "MFT", "mft", "FileSystem"}
+             "Prefetch", "MFT", "mft", "FileSystem",
+             # Execution/access evidence artifacts (Shimcache, UserAssist,
+             # Shellbags) — same plugin since they're all file-path-centric
+             # evidence, but routed to their own detection_engine branches.
+             "shimcache", "appcompatcache", "userassist", "shellbags",
+             "recyclebin"}
 
     def can_handle(self, key: str, data: Any) -> bool:
         return key in self._KEYS and isinstance(data, list)
 
     def analyze(self, key: str, data: list[dict]) -> list[Artifact]:
-        atype = ArtifactType.PREFETCH if "prefetch" in key.lower() else \
-                ArtifactType.MFT if "mft" in key.lower() else \
-                ArtifactType.FILE
+        key_lower = key.lower()
+        if "prefetch" in key_lower:
+            atype = ArtifactType.PREFETCH
+        elif "mft" in key_lower:
+            atype = ArtifactType.MFT
+        elif "shimcache" in key_lower or "appcompatcache" in key_lower:
+            atype = ArtifactType.UNKNOWN  # execution evidence, not a file write
+        elif "userassist" in key_lower:
+            atype = ArtifactType.UNKNOWN  # GUI execution evidence
+        elif "shellbag" in key_lower:
+            atype = ArtifactType.UNKNOWN  # navigation evidence, not a file
+        else:
+            atype = ArtifactType.FILE
         out = []
         for row in data:
             if not isinstance(row, dict):
                 continue
             ts = (row.get("Mtime") or row.get("modified") or
-                  row.get("timestamp") or row.get("last_execution") or "")
+                  row.get("timestamp") or row.get("last_execution") or
+                  row.get("last_modified") or row.get("last_executed") or
+                  row.get("last_accessed") or "")
             out.append(Artifact(
                 id        = _new_id(),
                 type      = atype,

@@ -26,13 +26,15 @@ from collections import defaultdict, Counter
 from datetime import datetime
 from typing import Any
 
+from app.detection_extended import detect_shimcache, detect_userassist, detect_shellbags
+
 logger = logging.getLogger(__name__)
 
 # Bump this whenever detection/sigma/correlation logic changes materially.
 # It's stamped into every analysis so a report makes clear which engine
 # produced it — and stale incidents (analyzed by an older build, then
 # re-viewed) are obvious instead of looking like a current result.
-ENGINE_VERSION = "2026.06.18-cloud-only-anon"
+ENGINE_VERSION = "2026.06.19-shimcache-userassist-shellbags"
 
 
 # ══════════════════════════════════════════════════
@@ -266,6 +268,17 @@ class DetectionEngine:
                 self._detect_tasks(key, rows)
             elif any(t in key_lower for t in ["evtx", "eventlog", "event", "logon"]):
                 self._detect_eventlogs(key, rows)
+            # NOTE: shimcache/userassist/shellbags must be checked BEFORE the
+            # generic "prefetch|amcache" / "registry" branches below, since
+            # those substring checks would otherwise swallow them (e.g.
+            # "shimcache" contains no overlap today, but "userassist" keys
+            # sometimes ship as "registry_userassist" from collectors).
+            elif "shimcache" in key_lower or "appcompatcache" in key_lower:
+                detect_shimcache(self._add_finding, key, rows)
+            elif "userassist" in key_lower:
+                detect_userassist(self._add_finding, key, rows)
+            elif "shellbag" in key_lower:
+                detect_shellbags(self._add_finding, key, rows)
             elif any(t in key_lower for t in ["prefetch", "amcache"]):
                 self._detect_execution(key, rows)
             elif any(t in key_lower for t in ["registry", "run", "autorun", "startup"]):
