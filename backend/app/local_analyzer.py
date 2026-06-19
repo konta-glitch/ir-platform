@@ -160,17 +160,56 @@ class LocalAnalyzer:
 
     async def generate_narrative(self, findings: list[dict],
                                   attack_chains: list[str],
-                                  context: str = "") -> dict:
+                                  context: str = "",
+                                  batch_size: int = 40) -> dict:
         """
-        Second LLM pass: generate an attack narrative + per-finding triage
-        for the top findings. Puts more LLM reasoning into the final report.
+        Second LLM pass: generate an attack narrative + per-finding triage.
+
+        IR PRINCIPLE: every finding gets reviewed — nothing is silently
+        dropped to fit a token budget. A persistence mechanism (service,
+        scheduled task, autorun) ranked "low" severity by the heuristic
+        scorer is exactly the kind of thing a top-N cutoff would hide, and
+        that's unacceptable for an incident-response tool — a responder
+        needs to see everything, not just what an automated severity score
+        happened to rank highest.
+
+        Instead of truncating to top-N, findings are processed in batches of
+        `batch_size` (default 40 — comfortably inside a 16K context window
+        even for verbose findings). Each batch gets its own narrative pass;
+        results are merged so the analyst gets ONE coherent narrative built
+        from ALL findings, not just the highest-scored fraction of them.
         """
         if not findings:
             return {}
 
-        top = findings[:25]
+        batches = [findings[i:i + batch_size] for i in range(0, len(findings), batch_size)]
+        logger.info(
+            f"Narrative pass: {len(findings)} findings in {len(batches)} batch(es) "
+            f"of up to {batch_size} (no findings excluded)"
+        )
+
+        batch_results = []
+        for batch_num, batch in enumerate(batches, start=1):
+            result = await self._generate_narrative_batch(
+                batch, attack_chains, context,
+                batch_num=batch_num, total_batches=len(batches),
+            )
+            if result:
+                batch_results.append(result)
+
+        if not batch_results:
+            return {}
+        if len(batch_results) == 1:
+            return batch_results[0]
+        return self._merge_narrative_batches(batch_results)
+
+    async def _generate_narrative_batch(
+        self, findings: list[dict], attack_chains: list[str], context: str,
+        batch_num: int = 1, total_batches: int = 1,
+    ) -> dict:
+        """Run one narrative pass over a single batch of findings."""
         finding_lines = []
-        for f in top:
+        for f in findings:
             ev = f.get("evidence", {})
             locator = ev.get("locator", f.get("artifact", ""))
             finding_lines.append(
@@ -181,23 +220,37 @@ class LocalAnalyzer:
         findings_text = "\n".join(finding_lines)
         chains_text = "\n".join(f"- {c}" for c in attack_chains) or "None detected"
 
-        system = """You are a senior incident responder writing the analysis section of an IR report.
+        batch_note = (
+            f"\nNOTE: This is batch {batch_num} of {total_batches} covering a subset "
+            f"of all findings in this incident — other batches cover the rest. Write "
+            f"your narrative for THIS batch's findings only; do not assume these are "
+            f"the only findings in the incident."
+            if total_batches > 1 else ""
+        )
+
+        system = f"""You are a senior incident responder writing the analysis section of an IR report.
 You are RIGOROUS about false positives — automated detections are leads, not conclusions.
+{batch_note}
 
 Given automated detection findings, produce a JSON object with:
-{
+{{
   "attack_narrative": "2-4 paragraph plain-language story of what likely happened, in logical order, referencing finding IDs like [F0001]. If the evidence is weak or ambiguous, SAY SO rather than inventing an attack.",
-  "key_findings": [{"finding_id": "F0001", "why_it_matters": "1-2 sentences", "recommended_action": "specific action", "assessment": "true_positive | likely_benign | needs_review"}],
-  "likely_false_positives": [{"finding_id": "F0002", "reason": "why this is probably benign"}],
+  "key_findings": [{{"finding_id": "F0001", "why_it_matters": "1-2 sentences", "recommended_action": "specific action", "assessment": "true_positive | likely_benign | needs_review"}}],
+  "likely_false_positives": [{{"finding_id": "F0002", "reason": "why this is probably benign"}}],
   "threat_assessment": "1 paragraph: severity, attacker sophistication, likely objective — calibrated to the ACTUAL evidence strength",
   "confidence": 0.0-1.0
-}
+}}
 
 Critical guidance to avoid false positives:
 - Many Sigma matches are low-fidelity (a tool CAN be misused, not that it WAS). Weigh them lightly unless corroborated.
 - A single finding type repeated many times (high occurrence count) is often noise or normal system behavior, not N separate attacks.
 - Distinguish "an attacker did X" from "X is technically possible here". Only claim compromise when evidence corroborates across artifacts (e.g. process tree + network + log clearing together).
 - If findings are mostly isolated medium-severity Sigma hits with no corroboration, the honest verdict is "suspicious indicators requiring review", NOT "active compromise".
+- PERSISTENCE MECHANISMS (services, scheduled tasks, autorun/registry Run keys) deserve
+  extra scrutiny regardless of the heuristic severity label — a "low" severity service
+  binary in a suspicious path can be just as significant as a "high" severity one-off
+  command, because persistence is how an attacker survives a reboot. Don't let the
+  severity label alone determine how much attention a finding gets in your narrative.
 - Reference finding IDs in brackets. Technical but readable. Output ONLY valid JSON."""
 
         user = f"""Analyst context: {context}
@@ -205,22 +258,64 @@ Critical guidance to avoid false positives:
 Detected attack chains:
 {chains_text}
 
-Top findings:
+Findings{f' (batch {batch_num}/{total_batches})' if total_batches > 1 else ''}:
 {findings_text}
 
 Write the IR analysis as JSON. Be rigorous: separate corroborated true positives from
 isolated low-confidence hits, and calibrate your confidence to the actual evidence."""
 
         try:
-            logger.info(f"Narrative pass: analyzing {len(top)} findings via LLM")
+            logger.info(
+                f"Narrative pass batch {batch_num}/{total_batches}: "
+                f"analyzing {len(findings)} findings via LLM"
+            )
             raw = await self._call_llm(system, user, temperature=0.2, max_tokens=2500)
             result = self._parse_json(raw)
             if result:
-                logger.info("Narrative pass: generated attack narrative")
+                logger.info(f"Narrative pass batch {batch_num}/{total_batches}: generated narrative")
             return result
         except Exception as e:
-            logger.warning(f"Narrative generation failed: {e}")
+            logger.warning(f"Narrative generation failed for batch {batch_num}/{total_batches}: {e}")
             return {}
+
+    @staticmethod
+    def _merge_narrative_batches(batch_results: list[dict]) -> dict:
+        """
+        Merge multiple per-batch narratives into one coherent result.
+
+        Narratives are concatenated with batch separators (each batch saw a
+        different slice of findings, so its narrative is only valid for that
+        slice — presenting them as distinct sections is more honest than
+        trying to algorithmically blend prose written by separate LLM calls).
+        key_findings and likely_false_positives are simple list unions since
+        finding_ids are unique across batches. Confidence is averaged.
+        """
+        narratives = [r.get("attack_narrative", "") for r in batch_results if r.get("attack_narrative")]
+        merged_narrative = "\n\n---\n\n".join(
+            f"[Findings batch {i+1}]\n{n}" for i, n in enumerate(narratives)
+        )
+
+        key_findings = []
+        false_positives = []
+        threat_assessments = []
+        confidences = []
+        for r in batch_results:
+            key_findings.extend(r.get("key_findings", []))
+            false_positives.extend(r.get("likely_false_positives", []))
+            if r.get("threat_assessment"):
+                threat_assessments.append(r["threat_assessment"])
+            if isinstance(r.get("confidence"), (int, float)):
+                confidences.append(r["confidence"])
+
+        return {
+            "attack_narrative": merged_narrative,
+            "key_findings": key_findings,
+            "likely_false_positives": false_positives,
+            "threat_assessment": " ".join(threat_assessments),
+            "confidence": sum(confidences) / len(confidences) if confidences else 0.5,
+            "batched": True,
+            "batch_count": len(batch_results),
+        }
 
     def _parse_json(self, text: str) -> dict:
         """Safely parse JSON from LLM output."""
