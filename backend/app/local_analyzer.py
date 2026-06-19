@@ -93,6 +93,15 @@ IMPORTANT RULES:
 - For unknown hashes/domains, always flag as a gap — the cloud model can check threat feeds.
 - Common TTPs (powershell execution, scheduled tasks, etc.) you know well — high confidence.
 - Novel or sophisticated attack patterns — lower confidence, flag for review.
+- DUAL-USE TOOLS (AnyDesk, TeamViewer, ScreenConnect, PsExec, and other legitimate
+  remote-access/admin software) are NOT inherently malicious — they are routinely
+  deployed by IT departments and MSPs. The mere PRESENCE of such a tool is NOT
+  sufficient grounds for malicious:true. Only set malicious:true on a dual-use
+  tool when the evidence corroborates misuse — e.g. unusual install location,
+  install time clustered with other suspicious activity, connection to a known-bad
+  IP, or absence of any legitimate business justification in the context provided.
+  Without that corroboration, set malicious:false and confidence below 0.5, with
+  confidence_reason noting it requires verification against IT asset records.
 - Respond ONLY with the JSON object, no markdown fences, no preamble."""
 
 

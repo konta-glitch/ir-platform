@@ -157,6 +157,20 @@ SUSPICIOUS_PATHS = [
     (r"C:\\Windows\\[^\\]+\.exe", "Executable directly in Windows root", "medium"),
 ]
 
+# Binaries Microsoft ships directly in C:\Windows\ (not System32/SysWOW64) by
+# default on every install. The SUSPICIOUS_PATHS regex above can't tell these
+# apart from a genuinely planted binary dropped in the same location — both
+# match "C:\Windows\<name>.exe" — so this allowlist exists to suppress the
+# known-legitimate set while still flagging anything NOT on this list.
+# explorer.exe in particular was firing as a false positive on every single
+# collection, since it legitimately lives at C:\Windows\explorer.exe on every
+# Windows machine that has ever booted.
+WINDOWS_ROOT_ALLOWLIST = {
+    "explorer.exe", "notepad.exe", "regedit.exe", "write.exe",
+    "hh.exe", "winhlp32.exe", "splwow64.exe", "bfsvc.exe",
+    "twunk_16.exe", "twunk_32.exe", "ssvagent.exe",
+}
+
 # Process masquerading — system process names that should run from System32
 SYSTEM_PROCESSES = {
     "svchost.exe": r"\\Windows\\System32\\svchost\.exe",
@@ -228,6 +242,24 @@ class DetectionEngine:
         self.findings: list[dict] = []
         self.stats: dict = defaultdict(int)
         self.evidence_index: dict[str, list] = defaultdict(list)
+
+    @staticmethod
+    def _check_suspicious_paths(path: str, proc_name: str = ""):
+        """
+        Yield (pattern, desc, sev) for every SUSPICIOUS_PATHS rule that
+        matches `path`, EXCEPT the "Executable directly in Windows root"
+        rule when `proc_name` is on WINDOWS_ROOT_ALLOWLIST.
+
+        Centralizing this in one place (instead of repeating the allowlist
+        check at all 6 call sites) means the fix can't accidentally be
+        applied at some call sites and missed at others.
+        """
+        name_lower = proc_name.lower().split("\\")[-1] if proc_name else ""
+        for pattern, desc, sev in SUSPICIOUS_PATHS:
+            if desc == "Executable directly in Windows root" and name_lower in WINDOWS_ROOT_ALLOWLIST:
+                continue
+            if re.search(pattern, path, re.IGNORECASE):
+                yield pattern, desc, sev
 
     def analyze(self, data: dict, progress_cb=None) -> dict:
         """
@@ -468,15 +500,14 @@ class DetectionEngine:
                     )
 
             # Check suspicious paths
-            for pattern, desc, sev in SUSPICIOUS_PATHS:
-                if re.search(pattern, path, re.IGNORECASE):
-                    self._add_finding(
-                        "process_anomaly", sev,
-                        f"Process from suspicious location: {desc}",
-                        f"Process '{name}' (PID {pid}) running from: {path}",
-                        key, evidence_base,
-                        score=60, mitre="T1036",
-                    )
+            for pattern, desc, sev in self._check_suspicious_paths(path, proc_name=name):
+                self._add_finding(
+                    "process_anomaly", sev,
+                    f"Process from suspicious location: {desc}",
+                    f"Process '{name}' (PID {pid}) running from: {path}",
+                    key, evidence_base,
+                    score=60, mitre="T1036",
+                )
 
             # Process masquerading — system process from wrong path
             if name in SYSTEM_PROCESSES and path:
@@ -593,20 +624,20 @@ class DetectionEngine:
             # Service binary in suspicious location — respect the PATTERN's
             # own severity instead of forcing "high". ProgramData alone is
             # 'low' (lots of legit software lives there), not high.
-            for pattern, desc, sev in SUSPICIOUS_PATHS:
-                if re.search(pattern, path, re.IGNORECASE):
-                    # Only flag medium+ path findings for services; 'low'
-                    # locations like ProgramData are too noisy on their own.
-                    if sev in ("critical", "high", "medium"):
-                        self._add_finding(
-                            "persistence", sev,
-                            "Service binary in suspicious location",
-                            f"Service '{name}' runs binary from: {path} ({desc})",
-                            key, evidence,
-                            score={"critical": 90, "high": 75, "medium": 50}.get(sev, 50),
-                            mitre="T1543.003",
-                        )
-                    break
+            bin_name = str(path).split("\\")[-1].split(" ")[0]
+            for pattern, desc, sev in self._check_suspicious_paths(path, proc_name=bin_name):
+                # Only flag medium+ path findings for services; 'low'
+                # locations like ProgramData are too noisy on their own.
+                if sev in ("critical", "high", "medium"):
+                    self._add_finding(
+                        "persistence", sev,
+                        "Service binary in suspicious location",
+                        f"Service '{name}' runs binary from: {path} ({desc})",
+                        key, evidence,
+                        score={"critical": 90, "high": 75, "medium": 50}.get(sev, 50),
+                        mitre="T1543.003",
+                    )
+                break
 
             # Service with encoded/suspicious command — but require the match
             # to be substantive (avoid matching benign flags like msiexec /V).
@@ -657,15 +688,15 @@ class DetectionEngine:
                         score=80, mitre="T1053.005",  # Scheduled Task
                     )
 
-            for pattern, desc, sev in SUSPICIOUS_PATHS:
-                if re.search(pattern, full, re.IGNORECASE):
-                    self._add_finding(
-                        "persistence", "medium",
-                        f"Scheduled task references suspicious path",
-                        f"Task '{name}' references {desc}: {full[:200]}",
-                        key, evidence,
-                        score=50, mitre="T1053.005",
-                    )
+            task_bin_name = str(command).split("\\")[-1].split(" ")[0]
+            for pattern, desc, sev in self._check_suspicious_paths(full, proc_name=task_bin_name):
+                self._add_finding(
+                    "persistence", "medium",
+                    f"Scheduled task references suspicious path",
+                    f"Task '{name}' references {desc}: {full[:200]}",
+                    key, evidence,
+                    score=50, mitre="T1053.005",
+                )
 
     # ── Event log detection ──
 
@@ -836,15 +867,14 @@ class DetectionEngine:
             evidence = {"row_index": idx, "name": name, "path": path}
 
             full = f"{name} {path}"
-            for pattern, desc, sev in SUSPICIOUS_PATHS:
-                if re.search(pattern, full, re.IGNORECASE):
-                    self._add_finding(
-                        "execution", "medium",
-                        f"Execution evidence from suspicious path",
-                        f"'{name}' executed from {desc}: {path}",
-                        key, evidence,
-                        score=45, mitre="T1204",
-                    )
+            for pattern, desc, sev in self._check_suspicious_paths(full, proc_name=name):
+                self._add_finding(
+                    "execution", "medium",
+                    f"Execution evidence from suspicious path",
+                    f"'{name}' executed from {desc}: {path}",
+                    key, evidence,
+                    score=45, mitre="T1204",
+                )
 
     # ── Registry persistence ──
 
@@ -887,8 +917,9 @@ class DetectionEngine:
 
             # Autorun pointing to a suspicious path — only flag in real autorun keys
             if value_str and any(mk in reg_key_l for mk in self.AUTORUN_KEY_MARKERS):
-                for pattern, desc, sev in SUSPICIOUS_PATHS:
-                    if sev in ("critical", "high", "medium") and re.search(pattern, value_str, re.IGNORECASE):
+                autorun_bin_name = value_str.split("\\")[-1].split(" ")[0]
+                for pattern, desc, sev in self._check_suspicious_paths(value_str, proc_name=autorun_bin_name):
+                    if sev in ("critical", "high", "medium"):
                         self._add_finding(
                             "persistence", "medium",
                             "Registry autorun from suspicious path",
@@ -953,18 +984,18 @@ class DetectionEngine:
 
             # Executable in suspicious location
             if suspicious_extensions.search(path):
-                for pattern, desc, sev in SUSPICIOUS_PATHS:
-                    if re.search(pattern, path, re.IGNORECASE):
-                        suspicious_path_count += 1
-                        if suspicious_path_count <= 100:  # Cap individual findings
-                            self._add_finding(
-                                "suspicious_file", "medium",
-                                f"Executable in suspicious location",
-                                f"Executable file in {desc}: {path}",
-                                key, {"row_index": idx, "path": path},
-                                score=45, mitre="T1036",
-                            )
-                        break
+                file_bin_name = str(path).split("\\")[-1]
+                for pattern, desc, sev in self._check_suspicious_paths(path, proc_name=file_bin_name):
+                    suspicious_path_count += 1
+                    if suspicious_path_count <= 100:  # Cap individual findings
+                        self._add_finding(
+                            "suspicious_file", "medium",
+                            f"Executable in suspicious location",
+                            f"Executable file in {desc}: {path}",
+                            key, {"row_index": idx, "path": path},
+                            score=45, mitre="T1036",
+                        )
+                    break
 
         # Summary finding if many suspicious files
         if suspicious_path_count > 100:
