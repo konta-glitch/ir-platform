@@ -863,7 +863,26 @@ class DetectionEngine:
             # scheduled task...) but Defender's own detection-and-tamper
             # stream had none, despite being one of the most direct signals
             # available: it either caught something, or someone disabled it.
-            elif eid == 1116:  # Malware/threat detected by Defender
+            #
+            # CHANNEL SCOPING IS REQUIRED: these event IDs are not globally
+            # unique to Defender — e.g. Event 3002 also exists in the MUI
+            # (Multilingual User Interface) channel for an unrelated
+            # purpose. A real production run produced exactly this false
+            # positive (22 "Defender real-time protection error" findings
+            # that were actually generic MUI errors) before this channel
+            # check was added. Mirrors the is_security_channel pattern
+            # already used above for Event 104/1102.
+            is_defender_channel = (
+                "windows defender" in channel
+                or "windows defender" in key.lower()
+            )
+
+            if not is_defender_channel and eid in (
+                1116, 1117, 5001, 5004, 5007, 5008, 5010, 5012, 3002
+            ):
+                pass  # one of our Defender event IDs, but wrong channel — skip silently
+
+            elif eid == 1116 and is_defender_channel:  # Malware/threat detected by Defender
                 # 1116 alone says "Defender SAW something" — doesn't say
                 # whether it was removed. The paired 1117 event (handled
                 # below) carries the action taken, including the dangerous
@@ -881,7 +900,7 @@ class DetectionEngine:
                     score=95, mitre="T1204",  # User Execution (the vector that got flagged)
                 )
 
-            elif eid == 1117:  # Defender action taken on a detected threat
+            elif eid == 1117 and is_defender_channel:  # Defender action taken on a detected threat
                 allowed = re.search(r"\bAllow\b", data_str, re.IGNORECASE) is not None
                 self._add_finding(
                     "execution",
@@ -900,7 +919,7 @@ class DetectionEngine:
                     score=95 if allowed else 80, mitre="T1204",
                 )
 
-            elif eid == 5001:  # Real-time protection disabled
+            elif eid == 5001 and is_defender_channel:  # Real-time protection disabled
                 self._add_finding(
                     "defense_evasion", "critical",
                     "Windows Defender real-time protection disabled",
@@ -910,7 +929,7 @@ class DetectionEngine:
                     score=90, mitre="T1562.001",  # Impair Defenses: Disable Tools
                 )
 
-            elif eid in (5010, 5012):  # Spyware/virus scanning disabled
+            elif eid in (5010, 5012) and is_defender_channel:  # Spyware/virus scanning disabled
                 what = "spyware/PUA" if eid == 5010 else "virus"
                 self._add_finding(
                     "defense_evasion", "critical",
@@ -920,7 +939,7 @@ class DetectionEngine:
                     score=88, mitre="T1562.001",
                 )
 
-            elif eid in (5004, 5008):  # Antimalware engine error/failure
+            elif eid in (5004, 5008) and is_defender_channel:  # Antimalware engine error/failure
                 self._add_finding(
                     "defense_evasion", "medium",
                     "Windows Defender engine error or failure",
@@ -931,7 +950,7 @@ class DetectionEngine:
                     score=50, mitre="T1562.001",
                 )
 
-            elif eid == 5007:  # Defender configuration changed
+            elif eid == 5007 and is_defender_channel:  # Defender configuration changed
                 self._add_finding(
                     "defense_evasion", "medium",
                     "Windows Defender configuration changed",
@@ -941,7 +960,7 @@ class DetectionEngine:
                     score=45, mitre="T1562.001",
                 )
 
-            elif eid == 3002:  # Real-time protection error
+            elif eid == 3002 and is_defender_channel:  # Real-time protection error
                 self._add_finding(
                     "defense_evasion", "medium",
                     "Windows Defender real-time protection error",
