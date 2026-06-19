@@ -22,6 +22,7 @@ These ZIPs are often password-protected (default: "infected").
 import json
 import logging
 import asyncio
+import re
 import zipfile
 import tarfile
 import tempfile
@@ -228,6 +229,116 @@ def _parse_registry_bytes(data: bytes, hive_name: str,
     return entries
 
 
+def _parse_mplog_lines(lines: list[str], source_file: str = "") -> list[dict]:
+    """
+    Parse Windows Defender MPLog (Microsoft Protection Log) plain-text lines
+    into structured events.
+
+    MPLog is collected as raw text by the PowerShell collector (see
+    defender_mplogs in ir_collect.ps1) since it's not a binary format like
+    EVTX/registry — parsing happens here so the logic lives in one place.
+
+    Covers the 4 documented event types (per Microsoft/CrowdStrike DFIR
+    research), each carrying evidence EVTX alone doesn't have:
+      - DETECTION_ADD: a threat was found, with the file path or PID involved
+      - EMS detection: memory-scan detections — process injection evidence
+      - SDN events: file existence + SHA1/SHA256, independent of EVTX
+      - Estimated Impact: per-process file-access evidence, including files
+        accessed that the process itself may have since deleted
+
+    Returns a list of dicts, one per matched event, with a `event_type`
+    field so the detection engine can route by category.
+    """
+    events = []
+
+    # DETECTION_ADD — e.g.:
+    #   2021-07-22T15:38:04.557Z DETECTION_ADD Ransom:Win32/Conti.ZA file:C:\ProgramData\badfile.exe
+    #   2021-07-22T15:38:04.557Z DETECTION_ADD Ransom:Win32/Conti.ZA process:pid:100128,ProcessStart:...
+    detection_re = re.compile(
+        r"(?P<ts>\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+DETECTION_ADD\s+(?P<threat>\S+)\s+"
+        r"(?:file:(?P<file>[^\s,]+)|process:pid:(?P<pid>\d+))"
+    )
+
+    # EMS detection — e.g.:
+    #   Engine:EMS detection: HackTool:Win64/CobaltStrike.A!!CobaltStrike.A64, sigseq=..., pid=6108
+    ems_re = re.compile(
+        r"EMS detection:\s*(?P<threat>[^,]+),\s*sigseq=\S+,\s*pid=(?P<pid>\d+)"
+    )
+
+    # SDN event — file path followed by sha1/sha2 on nearby lines is too
+    # unreliable to regex generically across MPLog format versions; capture
+    # the common single-line variant: path + both hashes on one line.
+    sdn_re = re.compile(
+        r"(?P<file>[A-Za-z]:\\[^\s,]+)\s+.*?[Ss]ha1[:\s]+(?P<sha1>[0-9a-fA-F]{40}).*?"
+        r"[Ss]ha2[56]*[:\s]+(?P<sha256>[0-9a-fA-F]{64})"
+    )
+
+    # Estimated Impact — e.g.:
+    #   2020-06-14T20:11:42.880Z ProcessImageName: explorer.exe, TotalTime: 30,
+    #   Count: 11, MaxTime: 15, MaxTimeFile: \Device\...\PuTTY (64-bit).lnk->, EstimatedImpact: 9%
+    impact_re = re.compile(
+        r"(?P<ts>\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+ProcessImageName:\s*(?P<proc>[^,]+),\s*"
+        r"TotalTime:\s*(?P<total_time>\d+),\s*Count:\s*(?P<count>\d+).*?"
+        r"MaxTimeFile:\s*(?P<max_time_file>[^,]+?)(?:->)?,\s*EstimatedImpact:\s*(?P<impact>[\d.]+)%"
+    )
+
+    for line in lines:
+        if not line or not line.strip():
+            continue
+
+        m = detection_re.search(line)
+        if m:
+            events.append({
+                "event_type": "detection",
+                "timestamp": m.group("ts"),
+                "threat_name": m.group("threat"),
+                "file": m.group("file") or "",
+                "pid": m.group("pid") or "",
+                "source_file": source_file,
+                "raw": line[:300],
+            })
+            continue
+
+        m = ems_re.search(line)
+        if m:
+            events.append({
+                "event_type": "ems_detection",
+                "threat_name": m.group("threat").strip(),
+                "pid": m.group("pid"),
+                "source_file": source_file,
+                "raw": line[:300],
+            })
+            continue
+
+        m = sdn_re.search(line)
+        if m:
+            events.append({
+                "event_type": "sdn",
+                "file": m.group("file"),
+                "sha1": m.group("sha1"),
+                "sha256": m.group("sha256"),
+                "source_file": source_file,
+                "raw": line[:300],
+            })
+            continue
+
+        m = impact_re.search(line)
+        if m:
+            events.append({
+                "event_type": "estimated_impact",
+                "timestamp": m.group("ts"),
+                "process": m.group("proc").strip(),
+                "files_accessed": m.group("count"),
+                "max_time_file": m.group("max_time_file").strip(),
+                "estimated_impact_pct": m.group("impact"),
+                "source_file": source_file,
+                "raw": line[:300],
+            })
+            continue
+
+    return events
+
+
 class CollectorManager:
     def __init__(self):
         self.settings = get_settings()
@@ -269,6 +380,8 @@ class CollectorManager:
         else:
             extracted_data = {"raw": file_path.read_text(errors="replace")[:500000]}
 
+        self._postprocess_defender_mplogs(extracted_data)
+
         total_items = sum(
             len(v) if isinstance(v, list) else 1
             for k, v in extracted_data.items()
@@ -283,6 +396,45 @@ class CollectorManager:
             "total_items": total_items,
             "data": extracted_data,
         }
+
+    def _postprocess_defender_mplogs(self, extracted_data: dict) -> None:
+        """
+        Transform the raw defender_mplogs collector output (one entry per
+        MPLog file, each with a `lines` array of raw text) into parsed,
+        structured events under the same key, ready for the detection
+        engine. Runs after any extraction path (zip/json/targz), since the
+        collector output shape is the same regardless of container format.
+
+        Mutates extracted_data in place. No-op if the key isn't present.
+        """
+        raw = extracted_data.get("defender_mplogs")
+        if not raw or not isinstance(raw, list):
+            return
+
+        all_events = []
+        for file_entry in raw:
+            if not isinstance(file_entry, dict):
+                continue
+            if file_entry.get("error"):
+                logger.warning(f"MPLog file unreadable: {file_entry.get('error')}")
+                continue
+            lines = file_entry.get("lines", [])
+            filename = file_entry.get("filename", "unknown")
+            if not lines:
+                continue
+            events = _parse_mplog_lines(lines, source_file=filename)
+            all_events.extend(events)
+
+        if all_events:
+            logger.info(
+                f"MPLog: parsed {len(all_events)} events "
+                f"({sum(1 for e in all_events if e['event_type'] == 'detection')} detections, "
+                f"{sum(1 for e in all_events if e['event_type'] == 'ems_detection')} EMS detections, "
+                f"{sum(1 for e in all_events if e['event_type'] == 'sdn')} SDN, "
+                f"{sum(1 for e in all_events if e['event_type'] == 'estimated_impact')} impact) "
+                f"from {len(raw)} MPLog file(s)"
+            )
+        extracted_data["defender_mplogs"] = all_events
 
     def _extract_zip_smart(self, zip_path: Path) -> tuple[dict, str]:
         """
@@ -809,6 +961,8 @@ class CollectorManager:
             except Exception:
                 pass
             break
+
+        self._postprocess_defender_mplogs(data)
 
         return {
             "filename": dir_path.name,

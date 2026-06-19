@@ -688,6 +688,53 @@ if (-not $Quick) {
         }
         $results
     }
+
+    Collect "defender_mplogs" {
+        # MPLog-*.log files: plain-text Defender troubleshooting logs that
+        # carry MUCH richer detail than the Operational EVTX log — process
+        # execution evidence, per-file scan results with hashes, real-time
+        # detection events, and behavior-monitoring entries that never
+        # surface as a Windows Event at all. Requires admin rights to read
+        # (same as registry hives) since the folder is locked down.
+        #
+        # These are NOT parsed here — they ship as raw text lines, same
+        # treatment as other text-log sources this collector gathers. The
+        # backend's collector.py is responsible for structured parsing
+        # (event-type extraction, hash/path correlation) since that keeps
+        # parsing logic in one place (Python) instead of duplicating it in
+        # PowerShell.
+        $mplogDir = "C:\ProgramData\Microsoft\Windows Defender\Support"
+        $results = @()
+        if (Test-Path $mplogDir) {
+            Get-ChildItem $mplogDir -Filter "MPLog-*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 5 |  # most recent logs are highest-value; cap to bound output size
+                ForEach-Object {
+                $logFile = $_
+                try {
+                    $lines = Get-Content $logFile.FullName -ErrorAction Stop
+                    $results += @{
+                        filename = $logFile.Name
+                        modified = $logFile.LastWriteTime.ToString("o")
+                        size = $logFile.Length
+                        line_count = $lines.Count
+                        # Cap lines shipped per file — MPLogs can be tens of
+                        # MB; the backend parser only needs detection/exec
+                        # evidence, not every routine scan-progress line.
+                        lines = $lines | Select-Object -First 20000
+                    }
+                } catch {
+                    $results += @{
+                        filename = $logFile.Name
+                        error = "Could not read (permissions?): $($_.Exception.Message)"
+                    }
+                }
+            }
+        } else {
+            $results += @{ error = "Defender Support directory not found or inaccessible" }
+        }
+        $results
+    }
 }
 
 # ═══════════════════════════════════════════
