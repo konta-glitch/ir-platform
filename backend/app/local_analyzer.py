@@ -20,6 +20,7 @@ import logging
 from typing import Any
 
 from app.config import get_settings
+from app.detection_engine import _cluster_findings_by_folder
 from app.lm_client import get_lm_client
 from app.models import (
     AnalysisResult,
@@ -182,6 +183,18 @@ class LocalAnalyzer:
         if not findings:
             return {}
 
+        # Cluster over the FULL finding set BEFORE batching. This matters
+        # because a cluster's members can land in different batches (e.g.
+        # finding #7 in batch 1, finding #41 in batch 2) — clustering after
+        # splitting would miss exactly the cross-batch case that matters
+        # most for large collections.
+        all_clusters = _cluster_findings_by_folder(findings)
+        if all_clusters:
+            logger.info(
+                f"Narrative pass: {len(all_clusters)} same-folder cluster(s) detected "
+                f"(e.g. multi-file tool installs) — will be flagged to the LLM per batch"
+            )
+
         batches = [findings[i:i + batch_size] for i in range(0, len(findings), batch_size)]
         logger.info(
             f"Narrative pass: {len(findings)} findings in {len(batches)} batch(es) "
@@ -190,9 +203,18 @@ class LocalAnalyzer:
 
         batch_results = []
         for batch_num, batch in enumerate(batches, start=1):
+            batch_ids = {f["id"] for f in batch}
+            # Only pass clusters that have at least one member in THIS batch —
+            # a cluster split across batches still gets mentioned in each
+            # relevant batch, so the LLM sees the connection no matter which
+            # batch happens to contain which member.
+            relevant_clusters = [
+                c for c in all_clusters if batch_ids & set(c["finding_ids"])
+            ]
             result = await self._generate_narrative_batch(
                 batch, attack_chains, context,
                 batch_num=batch_num, total_batches=len(batches),
+                clusters=relevant_clusters,
             )
             if result:
                 batch_results.append(result)
@@ -206,6 +228,7 @@ class LocalAnalyzer:
     async def _generate_narrative_batch(
         self, findings: list[dict], attack_chains: list[str], context: str,
         batch_num: int = 1, total_batches: int = 1,
+        clusters: list[dict] | None = None,
     ) -> dict:
         """Run one narrative pass over a single batch of findings."""
         finding_lines = []
@@ -219,6 +242,27 @@ class LocalAnalyzer:
             )
         findings_text = "\n".join(finding_lines)
         chains_text = "\n".join(f"- {c}" for c in attack_chains) or "None detected"
+
+        # Same-folder clusters — e.g. 4 separate "rare executable" findings
+        # that are actually 4 binaries from one installed tool. Without this,
+        # the narrative pass sees them as N isolated low-confidence items
+        # (confirmed: this was exactly how a JWrapper remote-access install,
+        # spread across 4 findings, got described as generic noise instead
+        # of one coherent tool installation).
+        cluster_text = ""
+        if clusters:
+            cluster_lines = [
+                f"  • {c['count']}× findings share folder '{c['folder']}': "
+                + ", ".join(f"[{i}]" for i in c["finding_ids"])
+                for c in clusters
+            ]
+            cluster_text = (
+                "\n\nIMPORTANT — these findings share a parent folder and very "
+                "likely represent ONE installed tool or staging event, not "
+                "independent occurrences. Treat each group as a single entity "
+                "in your narrative, not as separate low-confidence items:\n"
+                + "\n".join(cluster_lines)
+            )
 
         batch_note = (
             f"\nNOTE: This is batch {batch_num} of {total_batches} covering a subset "
@@ -257,6 +301,7 @@ Critical guidance to avoid false positives:
 
 Detected attack chains:
 {chains_text}
+{cluster_text}
 
 Findings{f' (batch {batch_num}/{total_batches})' if total_batches > 1 else ''}:
 {findings_text}
