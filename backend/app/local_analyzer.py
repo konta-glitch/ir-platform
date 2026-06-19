@@ -375,11 +375,67 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
             # Try to extract JSON from the text
             match = re.search(r'\{[\s\S]*\}', cleaned)
             if match:
+                candidate = match.group()
                 try:
-                    return json.loads(match.group())
-                except json.JSONDecodeError:
-                    pass
+                    return json.loads(candidate)
+                except json.JSONDecodeError as e2:
+                    # Smaller/weaker local models sometimes emit a raw
+                    # newline/tab/control character inside a JSON string
+                    # value instead of properly escaping it (e.g. a literal
+                    # line break in the middle of "attack_narrative": "..."
+                    # text) — valid per how the model "meant" it, but
+                    # invalid per the JSON spec, which json.loads() (and
+                    # Python's json.JSONDecodeError "Invalid control
+                    # character" message) correctly rejects. Escaping
+                    # control characters that appear strictly INSIDE a
+                    # quoted string (not the structural whitespace between
+                    # JSON tokens) recovers these without silently
+                    # corrupting otherwise-valid JSON.
+                    if "control character" in str(e2).lower():
+                        sanitized = self._escape_control_chars_in_strings(candidate)
+                        try:
+                            result = json.loads(sanitized)
+                            logger.info("JSON recovered after escaping control characters in string values")
+                            return result
+                        except json.JSONDecodeError:
+                            pass
             return {}
+
+    @staticmethod
+    def _escape_control_chars_in_strings(text: str) -> str:
+        """
+        Walk the text and escape raw control characters (newline, tab,
+        carriage return) ONLY when inside a JSON string (between unescaped
+        double quotes) — leaves structural JSON whitespace alone so
+        indentation/formatting between tokens isn't disturbed.
+        """
+        out = []
+        in_string = False
+        escape_next = False
+        for ch in text:
+            if escape_next:
+                out.append(ch)
+                escape_next = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                out.append(ch)
+                continue
+            if in_string and ch == "\n":
+                out.append("\\n")
+                continue
+            if in_string and ch == "\t":
+                out.append("\\t")
+                continue
+            if in_string and ch == "\r":
+                out.append("\\r")
+                continue
+            out.append(ch)
+        return "".join(out)
 
     async def analyze(self, anonymized_data: str, context: str = "",
                       data_type: str = "general") -> tuple[AnalysisResult, list[EscalationItem]]:
