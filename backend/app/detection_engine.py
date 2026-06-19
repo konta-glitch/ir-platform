@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import Any
 
 from app.detection_extended import detect_shimcache, detect_userassist, detect_shellbags
+from app.detection_dns_auth import detect_dns_anomalies, detect_auth_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +293,11 @@ class DetectionEngine:
             # Route to appropriate detector based on artifact type
             if any(t in key_lower for t in ["pslist", "process", "pstree"]):
                 self._detect_processes(key, rows)
+            elif "dns" in key_lower:
+                # Checked before the generic network branch so DNS query
+                # logs get DGA/tunneling analysis instead of falling into
+                # IP-based connection rules that don't apply to DNS rows.
+                detect_dns_anomalies(self._add_finding, key, rows)
             elif any(t in key_lower for t in ["netstat", "network", "connection"]):
                 self._detect_network(key, rows)
             elif any(t in key_lower for t in ["service", "executable"]):
@@ -302,6 +308,12 @@ class DetectionEngine:
                 self._detect_defender_mplogs(key, rows)
             elif any(t in key_lower for t in ["evtx", "eventlog", "event", "logon"]):
                 self._detect_eventlogs(key, rows)
+                # Auth pattern analysis runs as an ADDITIONAL pass over the
+                # same rows, not a replacement — _detect_eventlogs already
+                # does basic brute-force counting; this adds success-after-
+                # failure, multi-source, and off-hours pattern detection on
+                # top, without duplicating the existing per-event-ID logic.
+                detect_auth_patterns(self._add_finding, key, rows)
             # NOTE: shimcache/userassist/shellbags must be checked BEFORE the
             # generic "prefetch|amcache" / "registry" branches below, since
             # those substring checks would otherwise swallow them (e.g.
