@@ -1102,6 +1102,49 @@ class DetectionEngine:
         return default
 
 
+def _cluster_findings_by_folder(findings: list[dict]) -> list[dict]:
+    """
+    Detect groups of findings whose evidence paths share a common parent
+    folder — e.g. multiple binaries from the same install bundle
+    (elev_win.exe, session_win.exe, SimpleService.exe all under
+    'JWrapper-Remote Access bundle-00118607124\\...').
+
+    Without this, each binary shows up as an isolated "rare executable"
+    finding and an LLM reviewing a flat list has no structural cue that
+    they're part of ONE installation — it's left to infer that from reading
+    near-identical long paths, which smaller/weaker local models routinely
+    miss (confirmed: Mixtral-8x7B treated 4 same-folder JWrapper findings as
+    unrelated noise rather than one coherent persistence-tool installation).
+
+    Returns a list of {"folder": str, "finding_ids": [...], "count": int}
+    for any folder shared by 2+ findings, sorted by count descending.
+    """
+    from collections import defaultdict
+
+    folder_groups: dict = defaultdict(list)
+    for f in findings:
+        ev = f.get("evidence", {})
+        path = ev.get("path") or ev.get("locator") or ""
+        if not path or "\\" not in str(path):
+            continue
+        # Parent folder = everything except the filename
+        parent = str(path).rsplit("\\", 1)[0]
+        # Skip overly generic/shallow parents (e.g. just "C:" or a drive
+        # root) — those would cluster unrelated findings together and
+        # create false groupings instead of real ones.
+        if len(parent) < 15:
+            continue
+        folder_groups[parent].append(f["id"])
+
+    clusters = [
+        {"folder": folder, "finding_ids": ids, "count": len(ids)}
+        for folder, ids in folder_groups.items()
+        if len(ids) >= 2
+    ]
+    clusters.sort(key=lambda c: -c["count"])
+    return clusters
+
+
 def build_llm_context(detection_result: dict, max_findings: int = 200) -> str:
     """
     Build a comprehensive but token-efficient context for the LLM
@@ -1143,6 +1186,26 @@ def build_llm_context(detection_result: dict, max_findings: int = 200) -> str:
         lines.append("=== CROSS-DATASET CORRELATION ===")
         for bit in corr_bits:
             lines.append(f"  • {bit}")
+        lines.append("")
+
+    # NEW: explicit same-folder clustering. This is the fix for findings
+    # that ARE individually low-signal but collectively significant — e.g.
+    # 4 "rare executable" findings that are actually 4 binaries from the
+    # same installed tool. Surfacing this BEFORE the flat findings list
+    # means the LLM doesn't have to spot the pattern itself by comparing
+    # long paths character-by-character.
+    clusters = _cluster_findings_by_folder(detection_result["findings"])
+    if clusters:
+        lines.append("=== FINDINGS SHARING THE SAME FOLDER (likely one entity, not N) ===")
+        lines.append(
+            "The following finding groups share a parent folder. Findings in the "
+            "same group very likely represent ONE installed tool or one staging "
+            "event, not independent occurrences — treat them as a single entity "
+            "in your analysis rather than N separate low-confidence items."
+        )
+        for cluster in clusters[:15]:  # cap to keep context bounded
+            ids = ", ".join(f"[{i}]" for i in cluster["finding_ids"])
+            lines.append(f"  • {cluster['count']}× findings in '{cluster['folder']}': {ids}")
         lines.append("")
 
     # All findings, prioritized (critical/high first via pre-sort)
