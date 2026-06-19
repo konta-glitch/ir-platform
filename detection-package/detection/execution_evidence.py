@@ -1,10 +1,13 @@
 """
-Extended detection rules — Shimcache, UserAssist, Shellbags.
+detection/execution_evidence.py — execution evidence: Prefetch/Amcache,
+Shimcache, UserAssist, Shellbags.
 
-These three artifacts are already parsed by image_analyzer.py but previously
-fell through to `_detect_generic()`, which only does light frequency analysis.
-This module gives each one a dedicated detector with the specific forensic
-signal each artifact actually carries:
+All four artifact types answer some version of "did this binary run / get
+accessed", just via different OS subsystems, which is why they're grouped
+in one module:
+
+  - Prefetch/Amcache (detect_execution): the original, broadest execution
+    evidence — proves a binary ran, from the OS's own execution cache.
 
   - Shimcache (AppCompatCache): proves a binary EXECUTED at some point, even
     if the file itself has since been deleted. Attackers who clean up their
@@ -17,11 +20,6 @@ signal each artifact actually carries:
   - Shellbags: proves a user (or attacker with an interactive session)
     BROWSED to a folder — including removable drives, network shares, and
     folders that have since been deleted. Useful for staging/exfil paths.
-
-Design: this module is intentionally separate from detection_engine.py's
-core class so it can be unit-tested and extended independently. It is wired
-in via DetectionEngine._detect_shimcache / _detect_userassist /
-_detect_shellbags, which the main analyze() dispatch table routes to.
 """
 
 from __future__ import annotations
@@ -74,10 +72,36 @@ def _safe(value: Any) -> str:
 
 
 # ══════════════════════════════════════════════════
+# Prefetch / Amcache execution evidence (core)
+# ══════════════════════════════════════════════════
+
+def detect_execution(engine, key: str, rows: list[dict]) -> None:
+    """Prefetch/Amcache execution evidence — proves a binary ran."""
+    for idx, entry in enumerate(rows):
+        name = engine._get(entry, ["Name", "name", "Executable", "executable", "FileName"])
+        path = engine._get(entry, ["Path", "path", "FullPath"])
+
+        evidence = {"row_index": idx, "name": name, "path": path}
+
+        full = f"{name} {path}"
+        for pattern, desc, sev in engine._check_suspicious_paths(full, proc_name=name):
+            engine._add_finding(
+                "execution", "medium",
+                f"Execution evidence from suspicious path",
+                f"'{name}' executed from {desc}: {path}",
+                key, evidence,
+                score=45, mitre="T1204",
+            )
+
+
+
+
+
+# ══════════════════════════════════════════════════
 # Detectors — each takes (add_finding_fn, key, rows) and is self-contained
 # ══════════════════════════════════════════════════
 
-def detect_shimcache(add_finding, key: str, rows: list[dict]) -> None:
+def detect_shimcache(engine, key: str, rows: list[dict]) -> None:
     """
     Shimcache / AppCompatCache: each entry proves a binary executed (or was
     at least present and cached by the compatibility subsystem) at some
@@ -97,7 +121,7 @@ def detect_shimcache(add_finding, key: str, rows: list[dict]) -> None:
 
         for pattern, desc, sev in SUSPICIOUS_EXEC_PATHS:
             if re.search(pattern, path, re.IGNORECASE):
-                add_finding(
+                engine._add_finding(
                     "execution_evidence", sev,
                     f"Shimcache: {desc}",
                     f"AppCompatCache shows execution evidence for '{path}' "
@@ -110,7 +134,7 @@ def detect_shimcache(add_finding, key: str, rows: list[dict]) -> None:
                 )
 
         if DOUBLE_EXTENSION.search(path):
-            add_finding(
+            engine._add_finding(
                 "execution_evidence", "high",
                 "Shimcache: double-extension masquerade executed",
                 f"AppCompatCache shows execution of '{path}', which uses a "
@@ -121,7 +145,7 @@ def detect_shimcache(add_finding, key: str, rows: list[dict]) -> None:
             )
 
 
-def detect_userassist(add_finding, key: str, rows: list[dict]) -> None:
+def detect_userassist(engine, key: str, rows: list[dict]) -> None:
     """
     UserAssist: proves GUI-launched execution (Start menu, double-click,
     desktop shortcut) with a run count and last-execution timestamp.
@@ -142,7 +166,7 @@ def detect_userassist(add_finding, key: str, rows: list[dict]) -> None:
 
         for pattern, desc, sev in SUSPICIOUS_EXEC_PATHS:
             if re.search(pattern, path, re.IGNORECASE):
-                add_finding(
+                engine._add_finding(
                     "execution_evidence", sev,
                     f"UserAssist: {desc} (GUI-launched)",
                     f"UserAssist shows '{path}' was launched via GUI "
@@ -155,7 +179,7 @@ def detect_userassist(add_finding, key: str, rows: list[dict]) -> None:
                 )
 
         if DOUBLE_EXTENSION.search(path):
-            add_finding(
+            engine._add_finding(
                 "execution_evidence", "high",
                 "UserAssist: double-extension masquerade launched by user",
                 f"UserAssist shows the user double-clicked '{path}' "
@@ -172,7 +196,7 @@ def detect_userassist(add_finding, key: str, rows: list[dict]) -> None:
         # additional rule needed here; kept as a placeholder for tuning.
 
 
-def detect_shellbags(add_finding, key: str, rows: list[dict]) -> None:
+def detect_shellbags(engine, key: str, rows: list[dict]) -> None:
     """
     Shellbags: proves a user (or an attacker operating interactively)
     browsed to a folder in Explorer — including folders, removable drives,
@@ -189,7 +213,7 @@ def detect_shellbags(add_finding, key: str, rows: list[dict]) -> None:
 
         for pattern, desc, sev in SUSPICIOUS_BROWSE_PATHS:
             if re.search(pattern, path, re.IGNORECASE):
-                add_finding(
+                engine._add_finding(
                     "file_access", sev,
                     f"Shellbags: {desc}",
                     f"Shellbags show Explorer navigation to '{path}' "
