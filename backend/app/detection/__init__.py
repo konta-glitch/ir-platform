@@ -14,7 +14,8 @@ Package layout (one logical concern per file):
   file_anomalies.py               — file metadata anomaly detection
   generic.py                       — fallback for unrecognized artifacts
   behavior_correlation.py           — cross-finding attack chain detection
-  clustering.py                      — group findings into one entity
+  risk_scoring.py                    — process/entity risk aggregation
+  clustering.py                       — group findings into one entity
 
 Adding a NEW detector module: write detect_foo(engine, key, rows) in a new
 file, import it below, and add one register_route(...) call. Nothing else
@@ -46,6 +47,7 @@ from app.detection.execution_evidence import (
     detect_execution, detect_shimcache, detect_userassist, detect_shellbags,
 )
 from app.detection.file_anomalies import detect_file_anomalies
+from app.detection.yara_findings import detect_yara_matches
 from app.detection.generic import detect_generic  # noqa: F401 — used as fallback in base.py
 
 
@@ -59,6 +61,7 @@ from app.detection.generic import detect_generic  # noqa: F401 — used as fallb
 # broader ones so they don't get swallowed (e.g. "shimcache" before the
 # generic "prefetch|amcache" execution-evidence bucket).
 
+register_route(["yara_matches", "yara"], detect_yara_matches)
 register_route(["pslist", "process", "pstree"], detect_processes)
 register_route(["dns"], detect_dns_anomalies)
 register_route(["netstat", "network", "connection"], detect_network)

@@ -11,3 +11,4 @@ jinja2>=3.1
 dissect.target>=3.20
 dissect.eventlog>=3.10
 dissect.regf>=3.14
+yara-python>=4.5

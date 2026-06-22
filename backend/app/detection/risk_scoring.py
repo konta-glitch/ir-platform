@@ -46,27 +46,31 @@ MIN_CORROBORATING_CATEGORIES = 2
 RISK_SCORE_THRESHOLD = 130
 
 
-def _entity_key(finding: dict) -> tuple[str, str] | None:
+def _entity_keys(finding: dict) -> list[tuple[str, str]]:
     """
-    Resolve a grouping key for a finding: (kind, value) where kind is
-    'pid' or 'name' depending on what's available. Returns None for
-    findings with no usable process identity at all (e.g. a pure DNS or
-    registry-key finding with nothing process-like in its evidence).
+    Resolve ALL grouping keys for a finding — both ('pid', X) and
+    ('name', Y) when both are available. Returning multiple keys is what
+    lets a finding that only has a PID (e.g. a netstat connection) connect
+    to a finding that only has a name (e.g. a YARA content hit) when they
+    refer to the same binary: the process listing finding carries BOTH, so
+    it bridges the two single-key findings during the merge step below.
+
+    Returns an empty list for findings with no usable process identity.
     """
     ev = finding.get("evidence", {})
+    keys = []
 
     pid = ev.get("pid")
     if pid and str(pid).strip() and str(pid) != "?":
-        return ("pid", str(pid))
+        keys.append(("pid", str(pid)))
 
     name = ev.get("name") or ev.get("process")
     if name and str(name).strip():
-        # Normalize to just the binary name (strip any path that leaked in)
         clean = str(name).split("\\")[-1].split("/")[-1].lower().strip()
         if clean and clean not in ("", "unknown"):
-            return ("name", clean)
+            keys.append(("name", clean))
 
-    return None
+    return keys
 
 
 def aggregate_process_risk(engine) -> None:
@@ -75,25 +79,60 @@ def aggregate_process_risk(engine) -> None:
     compute cumulative risk per entity, and emit summary findings for
     entities that cross the corroboration threshold.
 
+    Uses a union-find-style merge so findings that share ANY identity key
+    (PID or binary name) end up in the same group — this connects, e.g., a
+    YARA content hit (name-only) to a process listing finding (pid+name)
+    for the same binary, which a single-key approach would leave isolated.
+
     Called from base.py's analyze() after all detector modules have run
     but before deduplication, so summary findings participate in the same
     sort/dedup/coverage pipeline as everything else.
     """
-    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    # Map each identity key to the set of finding indices that carry it.
+    key_to_findings: dict[tuple[str, str], list[int]] = defaultdict(list)
+    finding_keys: dict[int, list[tuple[str, str]]] = {}
 
-    for f in engine.findings:
-        # Don't fold MPLog/Defender/DNS/auth summary-style findings into
-        # process grouping — they're not about a single running process,
-        # and "Defender configuration changed" sharing a PID by accident
-        # with an unrelated process would produce a misleading group.
+    for i, f in enumerate(engine.findings):
+        # Don't fold Defender summary-style findings into process grouping —
+        # they're not about a single running process, and sharing a PID by
+        # accident with an unrelated process would produce a misleading group.
         if f.get("category") in ("defense_evasion",) and "Defender" in f.get("title", ""):
             continue
-        key = _entity_key(f)
-        if key:
-            groups[key].append(f)
+        keys = _entity_keys(f)
+        if keys:
+            finding_keys[i] = keys
+            for k in keys:
+                key_to_findings[k].append(i)
+
+    # Union-find: merge finding indices that share any key.
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for indices in key_to_findings.values():
+        for j in indices[1:]:
+            union(indices[0], j)
+
+    # Collect merged groups: root index → list of findings
+    merged: dict[int, list[dict]] = defaultdict(list)
+    merged_keys: dict[int, set] = defaultdict(set)
+    for i in finding_keys:
+        root = find(i)
+        merged[root].append(engine.findings[i])
+        merged_keys[root].update(finding_keys[i])
 
     summaries_emitted = 0
-    for (kind, value), group_findings in groups.items():
+    for root, group_findings in merged.items():
         categories = {f["category"] for f in group_findings}
         if len(categories) < MIN_CORROBORATING_CATEGORIES:
             continue
@@ -111,7 +150,18 @@ def aggregate_process_risk(engine) -> None:
         )
 
         category_breakdown = ", ".join(sorted(categories))
-        label = f"PID {value}" if kind == "pid" else f"process '{value}'"
+
+        # Derive a human label from the group's keys — prefer a binary name
+        # (more readable than a PID) when available, else fall back to PID.
+        keys = merged_keys[root]
+        name_keys = [v for (k, v) in keys if k == "name"]
+        pid_keys = [v for (k, v) in keys if k == "pid"]
+        if name_keys:
+            label = f"process '{name_keys[0]}'"
+            entity_kind, entity_value = "name", name_keys[0]
+        else:
+            label = f"PID {pid_keys[0]}"
+            entity_kind, entity_value = "pid", pid_keys[0]
 
         engine._add_finding(
             "correlated_risk",
@@ -128,7 +178,7 @@ def aggregate_process_risk(engine) -> None:
             f"alone — review the full chain: {', '.join(finding_ids)}.",
             "correlated",
             {
-                "entity_kind": kind, "entity_value": value,
+                "entity_kind": entity_kind, "entity_value": entity_value,
                 "finding_ids": finding_ids, "category_count": len(categories),
                 "categories": sorted(categories), "combined_score": total_score,
                 "mitre_techniques": mitre_techniques,
@@ -141,5 +191,5 @@ def aggregate_process_risk(engine) -> None:
     if summaries_emitted:
         logger.info(
             f"Process risk aggregation: {summaries_emitted} entity summary finding(s) "
-            f"emitted from {len(groups)} candidate group(s)"
+            f"emitted from {len(merged)} candidate group(s)"
         )

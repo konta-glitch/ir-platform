@@ -640,6 +640,46 @@ class CollectorManager:
                     pass
                 break
 
+        # ── YARA content scanning of uploaded files ──
+        # Every serious DFIR tool scans file CONTENT against malware
+        # patterns, not just metadata. We scan executables/scripts straight
+        # from the ZIP bytes (no disk extraction needed). Each hit becomes a
+        # row in the 'yara_matches' artifact, which the detection engine's
+        # yara route turns into findings. 100% offline.
+        try:
+            from app.yara_scanner import YaraScanner
+            scanner = YaraScanner()
+            if scanner.available:
+                yara_matches = []
+                files_scanned = 0
+                for uf in upload_files:
+                    decoded = unquote(uf).replace("\\", "/")
+                    try:
+                        info = zf.getinfo(uf)
+                    except KeyError:
+                        continue
+                    if not scanner.should_scan(decoded, info.file_size):
+                        continue
+                    try:
+                        file_bytes = zf.read(uf)
+                    except Exception:
+                        continue
+                    files_scanned += 1
+                    for hit in scanner.scan_bytes(file_bytes, filename=decoded):
+                        hit["_source_file"] = decoded
+                        yara_matches.append(hit)
+
+                if yara_matches:
+                    data["yara_matches"] = yara_matches
+                    logger.info(
+                        f"YARA: {len(yara_matches)} match(es) across {files_scanned} "
+                        f"scanned file(s)"
+                    )
+                else:
+                    logger.info(f"YARA: no matches ({files_scanned} file(s) scanned)")
+        except Exception as e:
+            logger.warning(f"YARA scanning skipped: {e}")
+
         # upload_files was already correctly identified above (decoded paths).
         # Of those, only EVTX and registry hives are parseable — filter first
         # so we don't iterate hundreds of thousands of irrelevant collected files.
