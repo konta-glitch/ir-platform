@@ -34,6 +34,40 @@ logger = logging.getLogger(__name__)
 # (malware payloads are typically small). Tunable.
 MAX_SCAN_SIZE = 50 * 1024 * 1024  # 50 MB
 
+# Path fragments for known security/EDR/AV/forensic software. These products
+# legitimately CONTAIN malware-pattern strings (PowerShell-attack signatures,
+# Mimikatz indicators, etc.) because detecting those patterns is their whole
+# job — so YARA string rules fire on them constantly as false positives.
+# Skipping them at the path level is standard DFIR practice (THOR/Loki ship
+# extensive allowlists for exactly this). Matched case-insensitively as a
+# substring of the full file path.
+#
+# NOTE: this is deliberately a SKIP-SCAN allowlist, not a "trust everything
+# here" rule — if an attacker plants malware OUTSIDE these vendor folders,
+# it's still scanned. The risk of a planted binary INSIDE a genuine
+# SentinelOne/Defender install folder is low (those dirs are protected), and
+# is far outweighed by the false-positive noise of scanning EDR binaries.
+SECURITY_SOFTWARE_PATH_ALLOWLIST = (
+    "\\sentinelone\\", "/sentinelone/", "sentinel agent",
+    "\\windows defender\\", "/windows defender/",
+    "\\microsoft\\windows defender", "/microsoft/windows defender",
+    "\\crowdstrike\\", "/crowdstrike/",
+    "\\carbon black\\", "/carbon black/", "\\carbonblack\\",
+    "\\cylance\\", "/cylance/",
+    "\\cortex xdr\\", "/cortex xdr/", "\\palo alto networks\\",
+    "\\sophos\\", "/sophos/",
+    "\\eset\\", "/eset/",
+    "\\bitdefender\\", "/bitdefender/",
+    "\\malwarebytes\\", "/malwarebytes/",
+    "\\trend micro\\", "/trend micro/",
+    "\\mcafee\\", "/mcafee/",
+    "\\symantec\\", "/symantec/",
+    "\\kaspersky\\", "/kaspersky/",
+    "\\huntress\\", "/huntress/",
+    "\\wazuh\\", "/wazuh/",
+    "\\velociraptor\\", "/velociraptor/",
+)
+
 # File extensions worth scanning. We scan executables, scripts, and
 # documents that can carry payloads — not media/data files where a YARA
 # string hit would almost always be a false positive.
@@ -72,12 +106,25 @@ class YaraScanner:
             logger.warning(f"No .yar/.yara files in {self.rules_dir} — scanning disabled")
             return
 
+        # Many real-world rulesets (YARA-Forge, signature-base) reference
+        # external variables that the scanning host is expected to provide
+        # — most commonly filename/filepath/extension/filetype. Declaring
+        # them at compile time (with placeholder values) lets those rules
+        # COMPILE; we then pass the real per-file values at scan time. Without
+        # this, every rule using these variables fails to compile and gets
+        # skipped, which would silently drop a large fraction of a real
+        # ruleset.
+        self._externals = {
+            "filename": "", "filepath": "", "extension": "",
+            "filetype": "", "owner": "", "md5": "",
+        }
+
         # yara.compile with filepaths={} compiles multiple rule files into
         # one ruleset. Namespacing by filename keeps rule-name collisions
         # across different rulesets from clobbering each other.
         filepaths = {f.stem: str(f) for f in rule_files}
         try:
-            self.rules = yara.compile(filepaths=filepaths)
+            self.rules = yara.compile(filepaths=filepaths, externals=self._externals)
             # Count rules for logging (iterate the compiled set once)
             self.rule_count = sum(1 for _ in self.rules)
             logger.info(f"YARA: compiled {len(rule_files)} rule file(s) from {self.rules_dir}")
@@ -93,13 +140,13 @@ class YaraScanner:
         good = {}
         for f in rule_files:
             try:
-                yara.compile(filepath=str(f))  # test it compiles
+                yara.compile(filepath=str(f), externals=self._externals)  # test it compiles
                 good[f.stem] = str(f)
             except yara.Error as e:
                 logger.warning(f"YARA: skipping un-compilable rule file {f.name}: {e}")
         if good:
             try:
-                self.rules = yara.compile(filepaths=good)
+                self.rules = yara.compile(filepaths=good, externals=self._externals)
                 self.rule_count = sum(1 for _ in self.rules)
                 logger.info(f"YARA: compiled {len(good)} of {len(rule_files)} rule file(s)")
             except yara.Error as e:
@@ -110,10 +157,16 @@ class YaraScanner:
         return self.rules is not None
 
     def should_scan(self, filename: str, size: int) -> bool:
-        """Decide whether a file is worth scanning (extension + size gate)."""
+        """Decide whether a file is worth scanning (extension + size + allowlist)."""
         if not self.available:
             return False
         if size <= 0 or size > MAX_SCAN_SIZE:
+            return False
+        # Skip known security-software install paths — their binaries
+        # legitimately contain malware-pattern strings (see allowlist
+        # comment) and produce only false positives.
+        fl = filename.lower()
+        if any(frag in fl for frag in SECURITY_SOFTWARE_PATH_ALLOWLIST):
             return False
         ext = Path(filename).suffix.lower()
         return ext in SCANNABLE_EXTENSIONS
@@ -127,8 +180,22 @@ class YaraScanner:
         if not self.available or not data:
             return []
 
+        # Provide real per-file values for the external variables declared
+        # at compile time, so rules that gate on filename/extension/etc.
+        # evaluate correctly instead of always seeing empty strings.
+        base = filename.replace("\\", "/").split("/")[-1]
+        ext = Path(base).suffix.lower().lstrip(".")
+        scan_externals = {
+            "filename": base,
+            "filepath": filename,
+            "extension": ext,
+            "filetype": "",
+            "owner": "",
+            "md5": "",
+        }
+
         try:
-            matches = self.rules.match(data=data)
+            matches = self.rules.match(data=data, externals=scan_externals)
         except Exception as e:
             logger.debug(f"YARA scan error on {filename}: {e}")
             return []
