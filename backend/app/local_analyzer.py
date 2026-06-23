@@ -162,32 +162,42 @@ class LocalAnalyzer:
     async def generate_narrative(self, findings: list[dict],
                                   attack_chains: list[str],
                                   context: str = "",
-                                  batch_size: int = 40) -> dict:
+                                  batch_size: int = 20) -> dict:
         """
         Second LLM pass: generate an attack narrative + per-finding triage.
 
-        IR PRINCIPLE: every finding gets reviewed — nothing is silently
-        dropped to fit a token budget. A persistence mechanism (service,
-        scheduled task, autorun) ranked "low" severity by the heuristic
-        scorer is exactly the kind of thing a top-N cutoff would hide, and
-        that's unacceptable for an incident-response tool — a responder
-        needs to see everything, not just what an automated severity score
-        happened to rank highest.
+        Only CRITICAL and HIGH severity findings are sent to the narrative
+        pass. MEDIUM/LOW findings are already captured in detection output —
+        the narrative LLM adds the most value on high-signal items where
+        attacker intent is clearest. This reduces batch count from ~19 to
+        ~5-8 for large collections, eliminating 504 timeouts and the
+        "Unterminated string" JSON parse failures caused by Mixtral hitting
+        its output limit mid-response.
 
-        Instead of truncating to top-N, findings are processed in batches of
-        `batch_size` (default 40 — comfortably inside a 16K context window
-        even for verbose findings). Each batch gets its own narrative pass;
-        results are merged so the analyst gets ONE coherent narrative built
-        from ALL findings, not just the highest-scored fraction of them.
+        Batch size is 20 (down from 40) to keep each prompt comfortably
+        inside Mixtral's context window even for verbose Sysmon findings.
         """
         if not findings:
             return {}
 
-        # Cluster over the FULL finding set BEFORE batching. This matters
-        # because a cluster's members can land in different batches (e.g.
-        # finding #7 in batch 1, finding #41 in batch 2) — clustering after
-        # splitting would miss exactly the cross-batch case that matters
-        # most for large collections.
+        # Filter to CRITICAL + HIGH only for narrative pass.
+        NARRATIVE_SEVERITIES = {"critical", "high"}
+        narrative_findings = [
+            f for f in findings
+            if str(f.get("severity", "")).lower() in NARRATIVE_SEVERITIES
+        ]
+
+        # Fallback: if somehow nothing qualifies, use all findings
+        if not narrative_findings:
+            narrative_findings = findings
+
+        logger.info(
+            f"Narrative pass: {len(narrative_findings)} findings selected "
+            f"(critical/high) from {len(findings)} total"
+        )
+
+        # Cluster over the FULL finding set BEFORE batching so cross-batch
+        # clusters are still detected correctly.
         all_clusters = _cluster_findings_by_folder(findings)
         if all_clusters:
             logger.info(
@@ -195,10 +205,10 @@ class LocalAnalyzer:
                 f"(e.g. multi-file tool installs) — will be flagged to the LLM per batch"
             )
 
-        batches = [findings[i:i + batch_size] for i in range(0, len(findings), batch_size)]
+        batches = [narrative_findings[i:i + batch_size] for i in range(0, len(narrative_findings), batch_size)]
         logger.info(
-            f"Narrative pass: {len(findings)} findings in {len(batches)} batch(es) "
-            f"of up to {batch_size} (no findings excluded)"
+            f"Narrative pass: {len(narrative_findings)} findings in {len(batches)} batch(es) "
+            f"of up to {batch_size}"
         )
 
         batch_results = []
