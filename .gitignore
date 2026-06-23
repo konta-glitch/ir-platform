@@ -35,7 +35,12 @@ images/*
 collections/*
 !collections/.gitkeep
 sigma_rules/hayabusa/
+sigma_rules/sigmahq/
 sigma_rules/.hayabusa_last_update
+
+# Downloaded detection rules (fetched via scripts/, never committed)
+backend/yara_rules/*
+!backend/yara_rules/starter_rules.yar
 
 # ── OS / Editor ──
 .DS_Store

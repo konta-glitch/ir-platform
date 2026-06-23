@@ -11,9 +11,9 @@ thousands more, use the installer script:
 
 ```bash
 # From the project root
-./install-sigma-rules.sh hayabusa    # recommended (curated, ~4000 rules)
-./install-sigma-rules.sh sigmahq     # full upstream community set
-./install-sigma-rules.sh both        # everything
+./scripts/install-sigma-rules.sh hayabusa    # recommended (curated, ~4000 rules)
+./scripts/install-sigma-rules.sh sigmahq     # full upstream community set
+./scripts/install-sigma-rules.sh both        # everything
 
 # Then reload into the running platform
 curl -X POST http://localhost:8080/api/sigma/reload
