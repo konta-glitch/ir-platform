@@ -65,8 +65,26 @@ auto-updated upstream):
 Only hand-written rules are committed: `backend/yara_rules/starter_rules.yar`
 and `sigma_rules/builtin_rules.yml`. Add your own custom rules there.
 
+## Tests
+
+Tests live in `backend/tests/` and run with pytest:
+
+```bash
+cd backend
+pip install -r requirements.txt pytest
+pytest
+```
+
+CI runs the same suite on every push and PR (`.github/workflows/ci.yml`).
+The current tests are intentionally lightweight smoke + registry checks:
+every module must import, and the detection/plugin registries must stay
+well-formed. When you add a detector or plugin, the registry tests already
+assert it's wired correctly — add a focused behaviour test for the new
+detection logic itself.
+
 ## Before opening a PR
 
+- [ ] `pytest` passes (from `backend/`)
 - [ ] `./scripts/verify-build.sh` passes
 - [ ] New parser/detector/route is a single-file addition where possible
 - [ ] No business logic leaked into `main.py` or `orchestrator.py`
