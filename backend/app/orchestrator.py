@@ -172,7 +172,7 @@ class Orchestrator:
                 )
             except Exception as exc:
                 logger.warning(f"Narrative pass failed: {exc}")
-# ── RAG indexing — enable semantic search on this incident's findings ──
+        # ── RAG indexing — enable semantic search on this incident's findings ──
         try:
             from app.rag_engine import get_engine
             rag = get_engine(str(incident_id))
