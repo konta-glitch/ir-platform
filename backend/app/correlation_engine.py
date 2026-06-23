@@ -39,6 +39,53 @@ ALLOWLIST_PATHS = [
     r"c:\\program files\\common files\\microsoft shared\\",
 ]
 
+# Legitimate AppData applications that appear "rare" because each version
+# installs to a unique versioned subdirectory (Slack app-4.42.x, Viber
+# 26.5.0.0, OneDrive 26.062.x etc.). Without this list the frequency
+# outlier detector flags every version bump as a malware staging indicator,
+# generating 20+ false-positive FQ findings per collection.
+#
+# Rule: only suppress from frequency_outlier — these paths are still
+# checked by YARA and other detectors. A genuine malware DLL placed inside
+# the Slack directory would still be caught.
+LEGITIMATE_APPDATA_APPS = [
+    # Communication
+    r"\\local\\slack\\",
+    r"\\roaming\\telegram desktop\\",
+    r"\\roaming\\viberpc\\",
+    r"\\local\\discord\\",
+    r"\\local\\teams\\",
+    r"\\roaming\\zoom\\",
+    r"\\local\\zoom\\",
+    r"\\roaming\\skype\\",
+    r"\\local\\microsoft\\teams\\",
+    # Microsoft
+    r"\\local\\microsoft\\onedrive\\",
+    r"\\local\\microsoft\\edge\\",
+    r"\\local\\microsoft\\edgewebview\\",
+    r"\\local\\temp\\.*windowsdesktop-runtime",
+    r"\\local\\temp\\.*\.be\\",           # .NET runtime bootstrapper
+    r"\\local\\temp\\.*\.cr\\",           # installer temp
+    # Browsers
+    r"\\local\\google\\chrome\\",
+    r"\\local\\chromium\\",
+    r"\\roaming\\opera software\\",
+    r"\\local\\brave-browser\\",
+    # Squirrel-based updaters (Slack, Teams, Discord all use Squirrel)
+    r"squirrel\.exe",
+    r"update\.exe",
+    # Known RMM tools that appear in this incident — flag via YARA/process
+    # detector instead, which has better context. Frequency outlier just
+    # produces noise here since they install to versioned subdirs.
+    r"\\apps\\2\.0\\",                      # ClickOnce apps (TruGrid etc.)
+]
+
+
+def _is_legitimate_appdata(path: str) -> bool:
+    """Return True if path matches a known-legitimate AppData application."""
+    p = path.lower()
+    return any(re.search(pat, p) for pat in LEGITIMATE_APPDATA_APPS)
+
 # These names are benign ONLY from the expected path
 KNOWN_GOOD_SYSTEM = {
     "svchost.exe", "lsass.exe", "services.exe", "csrss.exe", "winlogon.exe",
@@ -842,6 +889,12 @@ class CorrelationEngine:
         for path, count in rare_paths:
             # Skip allowlisted paths
             if any(re.search(allow, path) for allow in ALLOWLIST_PATHS):
+                continue
+            # Skip known-legitimate AppData applications (Slack versions,
+            # Viber updates, OneDrive, ClickOnce etc.) — they appear "rare"
+            # because each update installs to a unique versioned subdir, but
+            # they are not malware staging indicators.
+            if _is_legitimate_appdata(path):
                 continue
             # Rare + suspicious location = high interest
             if any(loc in path for loc in

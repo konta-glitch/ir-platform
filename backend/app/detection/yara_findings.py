@@ -56,6 +56,62 @@ HIGH_SPECIFICITY_RULES = {
 }
 
 
+# YARA rule name → (forced_severity, mitre, human_readable_family)
+# When a YARA hit matches one of these prefixes/substrings, the severity
+# is OVERRIDDEN to the value here regardless of the rule own metadata.
+#
+# Rationale: many YARA rules ship with conservative severity ("medium") to
+# reduce noise in threat hunting. But for an IR tool the stakes are
+# different — a HijackLoader stub in slack.exe is CRITICAL, not MEDIUM.
+MALWARE_SEVERITY_OVERRIDES: dict = {
+    # Loaders / droppers
+    "CAPE_Hijackloaderstub":      ("critical", "T1574.002", "HijackLoader stub"),
+    "CAPE_Hijackloader":          ("critical", "T1574.002", "HijackLoader"),
+    "HijackLoader":               ("critical", "T1574.002", "HijackLoader"),
+    # C2 / RAT frameworks
+    "SUSP_CobaltStrike":          ("critical", "T1071.001", "Cobalt Strike beacon"),
+    "CobaltStrike":               ("critical", "T1071.001", "Cobalt Strike"),
+    "CAPE_CobaltStrike":          ("critical", "T1071.001", "Cobalt Strike"),
+    "Meterpreter":                ("critical", "T1059.001", "Meterpreter"),
+    "CAPE_Meterpreter":           ("critical", "T1059.001", "Meterpreter"),
+    "Sliver":                     ("critical", "T1071.001", "Sliver C2"),
+    "Brute_Ratel":                ("critical", "T1071.001", "Brute Ratel C4"),
+    "CAPE_AsyncRAT":              ("critical", "T1571",     "AsyncRAT"),
+    "CAPE_NjRat":                 ("critical", "T1571",     "NjRAT"),
+    "CAPE_Quasar":                ("critical", "T1571",     "QuasarRAT"),
+    # Credential dumpers
+    "SUSP_Mimikatz":              ("critical", "T1003.001", "Mimikatz"),
+    "Mimikatz":                   ("critical", "T1003.001", "Mimikatz"),
+    "CAPE_Mimikatz":              ("critical", "T1003.001", "Mimikatz"),
+    # Ransomware
+    "CAPE_LockBit":               ("critical", "T1486",     "LockBit ransomware"),
+    "CAPE_Ryuk":                  ("critical", "T1486",     "Ryuk ransomware"),
+    "CAPE_Conti":                 ("critical", "T1486",     "Conti ransomware"),
+    "CAPE_BlackCat":              ("critical", "T1486",     "BlackCat/ALPHV ransomware"),
+    "Ransomware":                 ("critical", "T1486",     "Ransomware"),
+    # Obfuscators on non-vendor files
+    "COD3NYM_Reactor_Indicators": ("high",     "T1027.002", "Ezriz .NET Reactor obfuscation"),
+    "CAPE_DotNetReactor":         ("high",     "T1027.002", ".NET Reactor obfuscation"),
+    "CAPE_ConfuserEx":            ("high",     "T1027.002", "ConfuserEx obfuscation"),
+    # RMM tools — dual-use, context-dependent
+    "DITEKSHEN_INDICATOR_RMM":    ("high",     "T1219",     "Remote monitoring/management tool"),
+    "INDICATOR_RMM":              ("high",     "T1219",     "Remote monitoring/management tool"),
+    # Web shells
+    "Webshell":                   ("critical", "T1505.003", "Web shell"),
+    "CAPE_Webshell":              ("critical", "T1505.003", "Web shell"),
+    # Rootkits / bootkits
+    "Rootkit":                    ("critical", "T1014",     "Rootkit"),
+    "Bootkit":                    ("critical", "T1542",     "Bootkit"),
+}
+
+
+def _override_severity(rule: str):
+    """Return (severity, mitre, family_name) if rule matches a known-bad family, else None."""
+    for prefix, override in MALWARE_SEVERITY_OVERRIDES.items():
+        if rule.startswith(prefix) or prefix in rule:
+            return override
+    return None
+
 def _is_known_good_vendor_path(path: str) -> bool:
     p = str(path).lower()
     return any(marker in p for marker in KNOWN_GOOD_VENDOR_PATHS)
@@ -95,6 +151,18 @@ def detect_yara_matches(engine, key: str, rows: list[dict]) -> None:
                 score=5, mitre="",
             )
             continue
+
+        # Severity override for known malware families — many YARA rules ship
+        # with conservative severity to reduce threat-hunting noise, but an IR
+        # tool needs to surface HijackLoader in slack.exe as CRITICAL, not MEDIUM.
+        override = _override_severity(rule)
+        if override:
+            sev_override, mitre_override, family = override
+            if severity != sev_override:
+                severity = sev_override
+                if not mitre:
+                    mitre = mitre_override
+                description = f"{family} — {description}"
 
         # Score scales with severity — YARA content hits are high-confidence
         # by nature (a pattern matched actual file bytes), so these score
