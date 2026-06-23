@@ -85,9 +85,17 @@ docker compose up --build
 - Backend:  `http://localhost:8000`
 - Frontend: `http://localhost:5173`
 
-### Install detection rules
+### Detection rules
 
-Large rulesets are **not committed** — fetch them once after cloning:
+Both rulesets **auto-update in the background on container start** — Sigma
+(Hayabusa) and YARA (YARA-Forge) alike. The update is best-effort: it never
+blocks startup, and the platform works immediately on first boot from the
+committed starter sets (`backend/yara_rules/starter_rules.yar` and
+`sigma_rules/builtin_rules.yml`). Refresh cadence and the YARA package size
+are configurable via env vars — see `.env.example`.
+
+Large rulesets are **not committed**; the container fetches them itself. To
+pull them manually (e.g. for local non-Docker dev, or to force a refresh):
 
 ```bash
 ./scripts/install-yara-rules.sh core        # ~5,100 curated YARA-Forge rules
@@ -95,8 +103,8 @@ Large rulesets are **not committed** — fetch them once after cloning:
 docker compose restart backend              # recompile rulesets
 ```
 
-Hand-written `backend/yara_rules/starter_rules.yar` and
-`sigma_rules/builtin_rules.yml` *are* committed and always present.
+To force an update on next container start without waiting for the 24h
+interval, set `YARA_FORCE_UPDATE=true` / `SIGMA_FORCE_UPDATE=true` in `.env`.
 
 ## Development
 
