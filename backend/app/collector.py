@@ -83,38 +83,44 @@ def _parse_evtx_bytes(data: bytes, max_records: int = 0) -> list[dict]:
 def _evtx_record_to_dict(record) -> dict:
     """Convert a dissect.eventlog record into a normalized dict.
 
-    dissect records expose fields as attributes/dict-like access. We extract
-    the common Windows event fields, falling back gracefully across API shapes.
+    dissect.eventlog KeyValueCollection objects expose ALL event fields via
+    .items() as a flat dict — Image, CommandLine, ParentImage, GrantedAccess,
+    PipeName, TargetFilename, etc. We capture ALL of them so that
+    sigma_engine.py and detection/sysmon.py can match on them directly.
+
+    Previously this function only saved 5 fields (event_id, timestamp,
+    provider, channel, computer) and discarded everything else into a 'data'
+    string — causing Sigma rules and the sysmon detector to see empty fields
+    and miss ~145 of 278 EVTX attack samples (all Sysmon-based files).
     """
     out = {}
 
-    # dissect.eventlog records are typically dict-like (the parsed event).
-    # Try dict access first, then attribute access.
-    def _get(obj, *keys):
-        for k in keys:
+    # dissect KeyValueCollection supports .items() — gives every field flat,
+    # without needing to enumerate known keys in advance.
+    try:
+        raw = dict(record.items())
+    except Exception:
+        # Fallback for older dissect versions or other record shapes
+        if hasattr(record, "_asdict"):
             try:
-                if isinstance(obj, dict) and k in obj:
-                    return obj[k]
-                v = getattr(obj, k, None)
-                if v is not None:
-                    return v
+                raw = record._asdict()
             except Exception:
-                continue
-        return None
+                raw = {}
+        else:
+            raw = {}
 
-    # Many dissect records are namedtuple-like or expose .get
-    raw = record
-    if hasattr(record, "_asdict"):
-        try:
-            raw = record._asdict()
-        except Exception:
-            raw = record
+    # Copy ALL raw fields into out so Sigma rules and sysmon.py can access
+    # Image, CommandLine, ParentImage, TargetFilename, GrantedAccess, etc.
+    for k, v in raw.items():
+        if v is not None:
+            out[k] = v
 
-    eid = _get(raw, "EventID", "event_id", "Event_EventID", "Id")
+    # Normalize EventID — raw value is an int from dissect; also expose as
+    # string under 'EventID' since some Sigma rules compare it as a string.
+    eid = raw.get("EventID") or raw.get("event_id") or raw.get("Event_EventID")
     try:
         eid = int(eid) if eid is not None else None
     except (ValueError, TypeError):
-        # EventID sometimes comes as a dict {"#text": "4624"}
         if isinstance(eid, dict):
             try:
                 eid = int(eid.get("#text") or eid.get("text") or 0)
@@ -124,19 +130,15 @@ def _evtx_record_to_dict(record) -> dict:
             eid = None
 
     out["event_id"] = eid
-    out["timestamp"] = str(_get(raw, "TimeCreated", "timestamp", "SystemTime", "time") or "")
-    out["provider"] = str(_get(raw, "Provider", "Provider_Name", "ProviderName", "Channel") or "")
-    out["channel"] = str(_get(raw, "Channel", "channel", "LogName") or "")
-    out["computer"] = str(_get(raw, "Computer", "computer", "Hostname") or "")
-
-    # Capture the full record as searchable data (so detection/Sigma can match)
-    try:
-        if isinstance(raw, dict):
-            out["data"] = str({k: v for k, v in raw.items()})[:800]
-        else:
-            out["data"] = str(raw)[:800]
-    except Exception:
-        out["data"] = ""
+    # Sigma rules that use EventID as string condition need this alias
+    out["EventID"] = str(eid) if eid is not None else ""
+    # Normalized fields for cross-source compatibility
+    out["timestamp"] = str(raw.get("TimeCreated_SystemTime") or raw.get("TimeCreated") or raw.get("timestamp") or "")
+    out["provider"] = str(raw.get("Provider_Name") or raw.get("Provider") or raw.get("ProviderName") or "")
+    out["channel"] = str(raw.get("Channel") or raw.get("channel") or raw.get("LogName") or "")
+    out["computer"] = str(raw.get("Computer") or raw.get("computer") or raw.get("Hostname") or "")
+    # Full record as fallback text search target
+    out["data"] = str(raw)[:800]
 
     return out
 
