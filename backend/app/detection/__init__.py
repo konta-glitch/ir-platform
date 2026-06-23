@@ -40,6 +40,7 @@ from app.detection.processes import detect_processes, detect_services, detect_ta
 from app.detection.network import detect_network
 from app.detection.dns_dga import detect_dns_anomalies
 from app.detection.eventlogs import detect_eventlogs
+from app.detection.sysmon import detect_sysmon
 from app.detection.auth_patterns import detect_auth_patterns
 from app.detection.defender import detect_mplog_events
 from app.detection.persistence import detect_persistence_registry, detect_lnk
@@ -68,6 +69,7 @@ register_route(["netstat", "network", "connection"], detect_network)
 register_route(["service", "executable"], detect_services)
 register_route(["scheduledtask", "task", "command"], detect_tasks)
 register_route(["mplog", "defender_mplogs"], detect_mplog_events)
+register_route(["sysmon"], detect_sysmon)
 register_route(["evtx", "eventlog", "event", "logon"], detect_eventlogs)
 register_route(["shimcache", "appcompatcache"], detect_shimcache)
 register_route(["userassist"], detect_userassist)
