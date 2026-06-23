@@ -229,7 +229,80 @@ def _parse_registry_bytes(data: bytes, hive_name: str,
         logger.warning(f"Registry parse error ({hive_name}): {e}")
         entries.append({"error": str(e)})
     return entries
+def _parse_csv_to_rows(file_path: Path) -> dict:
+    """Parse CSV/TSV into structured rows for the detection engine."""
+    import csv as csv_mod
+    rows = []
+    try:
+        text = file_path.read_text(errors="replace")
+        dialect = csv_mod.Sniffer().sniff(text[:4096], delimiters=",\t;|")
+        reader = csv_mod.DictReader(text.splitlines(), dialect=dialect)
+        for i, row in enumerate(reader):
+            if i > 200_000:
+                break
+            rows.append(dict(row))
+    except Exception:
+        # Fallback: treat as text lines
+        rows = [{"raw": line, "timestamp": ""} 
+                for line in file_path.read_text(errors="replace").splitlines()
+                if line.strip()]
+    # Use "siem_export" as key so detection routing picks textlogs detector
+    return {"siem_export": rows}
 
+
+def _parse_textlog_to_rows(file_path: Path) -> dict:
+    """Parse text log file into rows with raw line + best-effort timestamp."""
+    import re
+    TS_RE = re.compile(
+        r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})'  # ISO
+        r'|(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})'      # syslog
+    )
+    rows = []
+    for line in file_path.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        ts_match = TS_RE.search(line)
+        rows.append({
+            "raw": line,
+            "timestamp": ts_match.group(0) if ts_match else "",
+        })
+        if len(rows) > 500_000:
+            break
+
+    # Detect log type from filename for routing key
+    name = file_path.name.lower()
+    if "auth" in name or "secure" in name:
+        key = "authlog"
+    elif "apache" in name or "nginx" in name or "access" in name:
+        key = "apache"
+    elif "suricata" in name or "eve" in name:
+        key = "suricata"
+    elif "zeek" in name or "bro" in name:
+        key = "zeek_conn"
+    elif "syslog" in name:
+        key = "syslog"
+    else:
+        key = "textlog"
+
+    return {key: rows}
+
+
+def _parse_jsonl_to_rows(file_path: Path) -> dict:
+    """Parse JSONL (one JSON object per line) — common for Suricata EVE."""
+    import json
+    rows = []
+    for line in file_path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            rows.append(obj if isinstance(obj, dict) else {"raw": line})
+        except json.JSONDecodeError:
+            rows.append({"raw": line})
+        if len(rows) > 200_000:
+            break
+    return {"suricata": rows}
 
 def _parse_mplog_lines(lines: list[str], source_file: str = "") -> list[dict]:
     """
@@ -377,10 +450,17 @@ class CollectorManager:
             extracted_data = self._read_json(file_path)
             source_type = "json"
         elif file_path.suffix.lower() in (".csv", ".tsv"):
-            extracted_data = {"csv_data": file_path.read_text(errors="replace")[:500000]}
+            extracted_data = _parse_csv_to_rows(file_path)
             source_type = "csv"
+        elif file_path.suffix.lower() in (".log", ".txt", ".syslog", ".out"):
+            extracted_data = _parse_textlog_to_rows(file_path)
+            source_type = "textlog"
+        elif file_path.suffix.lower() in (".jsonl",):
+            extracted_data = _parse_jsonl_to_rows(file_path)
+            source_type = "textlog"
         else:
-            extracted_data = {"raw": file_path.read_text(errors="replace")[:500000]}
+            extracted_data = _parse_textlog_to_rows(file_path)
+            source_type = "textlog"
 
         self._postprocess_defender_mplogs(extracted_data)
 

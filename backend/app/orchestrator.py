@@ -172,7 +172,15 @@ class Orchestrator:
                 )
             except Exception as exc:
                 logger.warning(f"Narrative pass failed: {exc}")
-
+# ── RAG indexing — enable semantic search on this incident's findings ──
+        try:
+            from app.rag_engine import get_engine
+            rag = get_engine(str(incident_id))
+            if not rag.is_indexed:
+                rag.index_findings(detection_result["findings"])
+                logger.info(f"RAG: indexed {rag.finding_count} findings for {incident_id}")
+        except Exception as exc:
+            logger.warning(f"RAG indexing skipped: {exc}")
         # ── Step 4: Merge findings + severity rollup ───────────────────────────
 
         analysis = IncidentService.elevate_severity(analysis, detection_result)

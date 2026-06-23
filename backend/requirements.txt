@@ -12,3 +12,5 @@ dissect.target>=3.20
 dissect.eventlog>=3.10
 dissect.regf>=3.14
 yara-python>=4.5
+sentence-transformers>=2.7.0   # RAG embeddings (optional, degrades gracefully)
+chromadb>=0.5.0                # optional persistent vector store (future)

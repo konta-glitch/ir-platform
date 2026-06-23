@@ -50,7 +50,7 @@ from app.detection.execution_evidence import (
 from app.detection.file_anomalies import detect_file_anomalies
 from app.detection.yara_findings import detect_yara_matches
 from app.detection.generic import detect_generic  # noqa: F401 — used as fallback in base.py
-
+from app.detection.textlogs import detect_textlogs
 
 # ══════════════════════════════════════════════════
 # Route registration — order matters (first match wins)
@@ -83,7 +83,13 @@ register_route(["searchglobs", "matches", "metadata", "upload"], detect_file_ano
 # same artifact key — auth-pattern analysis runs whenever an eventlog
 # route fires, without replacing detect_eventlogs's own brute-force check.
 register_additional_pass(["evtx", "eventlog", "event", "logon"], detect_auth_patterns)
-
+# Text-based log formats: syslog, Apache/Nginx, Zeek, Suricata EVE, CSV/SIEM
+register_route(
+    ["syslog", "authlog", "auth_log", "apache", "nginx", "iis",
+     "zeek", "bro", "suricata", "eve", "access_log", "textlog",
+     "csv_log", "siem_export", "firewall_log"],
+    detect_textlogs,
+)
 
 # ══════════════════════════════════════════════════
 # LLM context builder

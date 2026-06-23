@@ -759,3 +759,28 @@ async def download_incident_report(incident_id: str):
         media_type="text/markdown",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+@app.get("/api/incidents/{incident_id}/search")
+async def rag_search(incident_id: str, q: str, top_k: int = 15):
+    """Semantic search over incident findings."""
+    from app.rag_engine import get_engine
+    engine = get_engine(incident_id)
+    if not engine.is_indexed:
+        raise HTTPException(404, "Findings not indexed yet — run analysis first")
+    results = engine.search(q, top_k=top_k)
+    return {"query": q, "results": results, "total": len(results)}
+
+
+@app.post("/api/incidents/{incident_id}/ask")
+async def rag_ask(incident_id: str, body: dict):
+    """RAG: answer a natural-language question grounded in incident findings."""
+    from app.rag_engine import get_engine
+    from app.lm_client import get_lm_client
+    question = body.get("question", "")
+    if not question:
+        raise HTTPException(400, "question field required")
+    engine = get_engine(incident_id)
+    if not engine.is_indexed:
+        raise HTTPException(404, "Findings not indexed yet — run analysis first")
+    lm = get_lm_client()
+    answer = await engine.query_llm(question, lm)
+    return {"question": question, "answer": answer}
