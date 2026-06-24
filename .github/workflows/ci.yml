@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-tests:
+    name: Backend tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        # Install the runtime deps the tests actually exercise. The two heavy,
+        # explicitly-optional packages (sentence-transformers -> torch, and
+        # chromadb) are skipped: the code degrades gracefully without them and
+        # installing torch would make CI ~10x slower for no test coverage gain.
+        run: |
+          python -m pip install --upgrade pip
+          grep -vE 'sentence-transformers|chromadb' requirements.txt > ci-requirements.txt
+          pip install -r ci-requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest
