@@ -480,6 +480,25 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
                             return result
                         except json.JSONDecodeError:
                             pass
+
+            # Last resort: json-repair fixes structural mistakes the model
+            # sometimes makes (a missing ':' or ',', an unclosed quote, a
+            # trailing comma) that none of the above handles — exactly the
+            # "Expecting ':' delimiter" failures DeepSeek-R1 produces on the
+            # occasional narrative batch. Tried last because it's the most
+            # permissive (and slowest) path; strict json.loads wins whenever the
+            # output is already valid. Runs on the extracted candidate when we
+            # have one, else the cleaned text.
+            repair_input = candidate if candidate else cleaned
+            try:
+                from json_repair import repair_json
+                repaired = repair_json(repair_input, return_objects=True)
+                if isinstance(repaired, dict) and repaired:
+                    logger.info("JSON recovered via json-repair")
+                    return repaired
+            except Exception as e3:
+                logger.debug(f"json-repair could not recover output: {e3}")
+
             return {}
 
     @staticmethod
