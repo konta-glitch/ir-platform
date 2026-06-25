@@ -399,17 +399,39 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
     def _parse_json(self, text: str) -> dict:
         """Safely parse JSON from LLM output."""
         cleaned = text.strip()
+
+        # Reasoning models (DeepSeek-R1, QwQ, etc.) emit a <think>...</think>
+        # chain-of-thought block BEFORE the actual answer. That block is prose,
+        # often containing stray '{' '}' characters, so it both (a) makes the
+        # response not start with JSON and (b) confuses a greedy { ... } regex
+        # into grabbing the wrong span. Strip it before doing anything else.
+        # Handles a closed block, and the degenerate case where the model only
+        # opened <think> and we keep everything after it.
+        if "<think>" in cleaned:
+            if "</think>" in cleaned:
+                cleaned = cleaned.split("</think>", 1)[1].strip()
+            else:
+                cleaned = cleaned.split("<think>", 1)[1].strip()
+
+        # Strip ```json fences if present.
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
             cleaned = re.sub(r"\s*```$", "", cleaned)
+
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as e:
             logger.warning(f"JSON parse failed: {e}")
-            # Try to extract JSON from the text
-            match = re.search(r'\{[\s\S]*\}', cleaned)
-            if match:
-                candidate = match.group()
+            # Prefer a brace-balanced extraction over a greedy regex: scan for
+            # the first '{' and walk to its matching '}', respecting strings
+            # and escapes. This survives reasoning text or trailing prose that
+            # contains unbalanced braces, which the old r'\{[\s\S]*\}' caught
+            # wrongly (it grabbed from the first '{' to the LAST '}' anywhere).
+            candidate = self._extract_balanced_json(cleaned)
+            if candidate is None:
+                match = re.search(r'\{[\s\S]*\}', cleaned)
+                candidate = match.group() if match else None
+            if candidate:
                 try:
                     return json.loads(candidate)
                 except json.JSONDecodeError as e2:
@@ -434,6 +456,57 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
                         except json.JSONDecodeError:
                             pass
             return {}
+
+    @staticmethod
+    def _extract_balanced_json(text: str) -> str | None:
+        """
+        Return the first brace-balanced {...} span that actually parses as
+        JSON, or None.
+
+        Reasoning text before the real answer can contain balanced-but-junk
+        braces like '{stray}'. So we don't just return the first balanced
+        span — we try each candidate (scanning successive '{' positions) and
+        return the first one json.loads() accepts. This skips prose braces and
+        lands on the real object.
+        """
+        search_from = 0
+        while True:
+            start = text.find("{", search_from)
+            if start == -1:
+                return None
+            depth = 0
+            in_string = False
+            escape_next = False
+            end = -1
+            for i in range(start, len(text)):
+                ch = text[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\":
+                    escape_next = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end != -1:
+                candidate = text[start:end + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate  # parses cleanly — this is the one
+                except json.JSONDecodeError:
+                    pass  # balanced but not valid JSON (e.g. '{stray}') — keep looking
+            # Advance past this '{' and try the next candidate.
+            search_from = start + 1
 
     @staticmethod
     def _escape_control_chars_in_strings(text: str) -> str:
