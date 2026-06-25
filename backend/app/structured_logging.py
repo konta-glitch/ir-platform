@@ -34,7 +34,24 @@ class AuditLogger:
 
     def __init__(self, path: Path = AUDIT_PATH):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # NOTE: do NOT create the directory here. This class is instantiated at
+        # import time (module-level _audit), and importing a module must not
+        # touch the filesystem — in CI (no /app dir, no root write access) that
+        # raised PermissionError and broke `import app.main`. The directory is
+        # created lazily on first write instead.
+        self._dir_ready = False
+
+    def _ensure_dir(self) -> bool:
+        """Create the log directory on first use. Returns False if it can't."""
+        if self._dir_ready:
+            return True
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._dir_ready = True
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Audit dir unavailable: {e}")
+            return False
+        return True
 
     def record(self, event_type: str, **fields: Any) -> str:
         """Write one audit record. Returns the record's unique id."""
@@ -45,6 +62,8 @@ class AuditLogger:
             "event": event_type,
             **fields,
         }
+        if not self._ensure_dir():
+            return record_id  # degrade gracefully — no audit dir available
         try:
             with open(self.path, "a") as f:
                 f.write(json.dumps(entry, default=str) + "\n")

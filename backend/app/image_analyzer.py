@@ -43,7 +43,15 @@ class ImageAnalyzer:
 
     def __init__(self):
         self.images_dir = Path("/app/images")
-        self.images_dir.mkdir(parents=True, exist_ok=True)
+        # Don't hard-fail at import (main.py builds this at module level). On a
+        # bare CI runner /app isn't writable; degrade by skipping dir creation.
+        # The container has the volume mounted, so behaviour there is unchanged.
+        try:
+            self.images_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logging.getLogger(__name__).warning(
+                f"Images dir {self.images_dir} unavailable ({e})"
+            )
 
     def list_available_images(self) -> list[dict]:
         """List images available in the /app/images volume."""
