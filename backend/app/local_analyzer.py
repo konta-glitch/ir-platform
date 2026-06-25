@@ -162,38 +162,48 @@ class LocalAnalyzer:
     async def generate_narrative(self, findings: list[dict],
                                   attack_chains: list[str],
                                   context: str = "",
-                                  batch_size: int = 20) -> dict:
+                                  batch_size: int = 0) -> dict:
         """
         Second LLM pass: generate an attack narrative + per-finding triage.
 
-        Only CRITICAL and HIGH severity findings are sent to the narrative
-        pass. MEDIUM/LOW findings are already captured in detection output —
-        the narrative LLM adds the most value on high-signal items where
-        attacker intent is clearest. This reduces batch count from ~19 to
-        ~5-8 for large collections, eliminating 504 timeouts and the
-        "Unterminated string" JSON parse failures caused by Mixtral hitting
-        its output limit mid-response.
+        Batches are processed CONCURRENTLY (asyncio) against the local LLM,
+        bounded by settings.narrative_concurrency, so wall-clock time scales
+        down roughly with the concurrency level instead of being the sum of
+        all batches. Batch ORDER is preserved in the merged result so the
+        narrative reads in sequence regardless of completion order.
 
-        Batch size is 20 (down from 40) to keep each prompt comfortably
-        inside Mixtral's context window even for verbose Sysmon findings.
+        Severity scope is configurable via settings.narrative_severities and
+        defaults to ALL severities — this is an IR tool, so nothing is dropped
+        from the narrative. (Set it to "critical,high" only if you explicitly
+        want to trade coverage for speed.)
         """
         if not findings:
             return {}
 
-        # Filter to CRITICAL + HIGH only for narrative pass.
-        NARRATIVE_SEVERITIES = {"critical", "high"}
+        from app.config import get_settings
+        import asyncio
+
+        settings = get_settings()
+        if not batch_size:
+            batch_size = settings.narrative_batch_size
+        concurrency = max(1, settings.narrative_concurrency)
+
+        # Severity scope — defaults to every severity (full coverage).
+        allowed = {
+            s.strip().lower()
+            for s in str(settings.narrative_severities).split(",")
+            if s.strip()
+        }
         narrative_findings = [
             f for f in findings
-            if str(f.get("severity", "")).lower() in NARRATIVE_SEVERITIES
+            if not allowed or str(f.get("severity", "")).lower() in allowed
         ]
-
-        # Fallback: if somehow nothing qualifies, use all findings
         if not narrative_findings:
             narrative_findings = findings
 
         logger.info(
             f"Narrative pass: {len(narrative_findings)} findings selected "
-            f"(critical/high) from {len(findings)} total"
+            f"(severities: {','.join(sorted(allowed)) or 'all'}) from {len(findings)} total"
         )
 
         # Cluster over the FULL finding set BEFORE batching so cross-batch
@@ -205,14 +215,16 @@ class LocalAnalyzer:
                 f"(e.g. multi-file tool installs) — will be flagged to the LLM per batch"
             )
 
-        batches = [narrative_findings[i:i + batch_size] for i in range(0, len(narrative_findings), batch_size)]
+        batches = [narrative_findings[i:i + batch_size]
+                   for i in range(0, len(narrative_findings), batch_size)]
         logger.info(
             f"Narrative pass: {len(narrative_findings)} findings in {len(batches)} batch(es) "
-            f"of up to {batch_size}"
+            f"of up to {batch_size}, concurrency={concurrency}"
         )
 
-        batch_results = []
-        for batch_num, batch in enumerate(batches, start=1):
+        sem = asyncio.Semaphore(concurrency)
+
+        async def run_batch(batch_num: int, batch: list[dict]):
             batch_ids = {f["id"] for f in batch}
             # Only pass clusters that have at least one member in THIS batch —
             # a cluster split across batches still gets mentioned in each
@@ -221,13 +233,25 @@ class LocalAnalyzer:
             relevant_clusters = [
                 c for c in all_clusters if batch_ids & set(c["finding_ids"])
             ]
-            result = await self._generate_narrative_batch(
-                batch, attack_chains, context,
-                batch_num=batch_num, total_batches=len(batches),
-                clusters=relevant_clusters,
-            )
-            if result:
-                batch_results.append(result)
+            async with sem:
+                return await self._generate_narrative_batch(
+                    batch, attack_chains, context,
+                    batch_num=batch_num, total_batches=len(batches),
+                    clusters=relevant_clusters,
+                )
+
+        # Launch all batches; gather preserves input order, so batch_results
+        # stays in narrative sequence even though they finish out of order.
+        tasks = [run_batch(i, b) for i, b in enumerate(batches, start=1)]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        batch_results = []
+        for i, res in enumerate(gathered, start=1):
+            if isinstance(res, Exception):
+                logger.error(f"Narrative batch {i} failed: {res}")
+                continue
+            if res:
+                batch_results.append(res)
 
         if not batch_results:
             return {}
