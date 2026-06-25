@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     # roughly N-fold. Cap it to what your LLM server can handle without
     # thrashing — LM Studio with one loaded model handles 2-4 well; raise if
     # you run a server that batches requests. 1 = old sequential behaviour.
+    # ── LLM token budget ──
+    # Max tokens the local LLM may generate per call. Reasoning models
+    # (DeepSeek-R1, QwQ) spend a large share of this on their <think> block
+    # BEFORE the answer, so a budget fine for a plain model leaves no room for
+    # the actual JSON and you get an empty "received 0 chars" response. 16000
+    # leaves headroom for reasoning + answer.
+    llm_max_tokens: int = 16000
+
     narrative_concurrency: int = 4
     # Findings per narrative batch. Smaller = more, shorter prompts (more
     # parallelism, less chance of hitting the model's output limit mid-JSON).
