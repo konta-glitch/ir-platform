@@ -135,12 +135,15 @@ class LocalAnalyzer:
                         max_tokens: int = 0,
                         timeout: float = 0.0) -> str:
         """Call the local LLM via LM Studio (auto-detects API format)."""
+        from app.config import get_settings
+        settings = get_settings()
         if not max_tokens:
-            from app.config import get_settings
-            max_tokens = get_settings().llm_max_tokens
-        kwargs = {}
-        if timeout:
-            kwargs["timeout"] = timeout
+            max_tokens = settings.llm_max_tokens
+        # Fall back to the configured baseline timeout (not httpx's short 300s
+        # default) so slow reasoning models aren't cut off mid-generation. The
+        # narrative pass passes its own, longer timeout explicitly.
+        if not timeout:
+            timeout = settings.llm_timeout
         return await self.lm.chat(
             messages=[
                 {"role": "system", "content": system},
@@ -148,7 +151,7 @@ class LocalAnalyzer:
             ],
             temperature=temperature,
             max_tokens=max_tokens,
-            **kwargs,
+            timeout=timeout,
         )
 
     async def chat_messages(self, messages: list[dict],
@@ -160,11 +163,13 @@ class LocalAnalyzer:
         With `tools`, returns the full assistant message dict (may contain
         tool_calls) for native function calling. Without, returns text.
         """
+        from app.config import get_settings
         return await self.lm.chat(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
+            timeout=get_settings().llm_timeout,
         )
 
     async def generate_narrative(self, findings: list[dict],
