@@ -132,8 +132,11 @@ class LocalAnalyzer:
 
     async def _call_llm(self, system: str, user: str,
                         temperature: float = 0.1,
-                        max_tokens: int = 6000) -> str:
+                        max_tokens: int = 0) -> str:
         """Call the local LLM via LM Studio (auto-detects API format)."""
+        if not max_tokens:
+            from app.config import get_settings
+            max_tokens = get_settings().llm_max_tokens
         return await self.lm.chat(
             messages=[
                 {"role": "system", "content": system},
@@ -348,7 +351,7 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
                 f"Narrative pass batch {batch_num}/{total_batches}: "
                 f"analyzing {len(findings)} findings via LLM"
             )
-            raw = await self._call_llm(system, user, temperature=0.2, max_tokens=2500)
+            raw = await self._call_llm(system, user, temperature=0.2)
             result = self._parse_json(raw)
             if result:
                 logger.info(f"Narrative pass batch {batch_num}/{total_batches}: generated narrative")

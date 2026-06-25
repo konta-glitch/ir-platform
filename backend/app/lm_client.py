@@ -97,7 +97,7 @@ class LMStudioClient:
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.1,
-        max_tokens: int = 6000,
+        max_tokens: int = 16000,
         timeout: float = 300.0,
         tools: list[dict] | None = None,
     ) -> str:
@@ -232,7 +232,29 @@ class LMStudioClient:
                 # caller can inspect tool_calls (native function calling).
                 if tools:
                     return message
-                return (message.get("content") or "").strip()
+
+                content = (message.get("content") or "").strip()
+                # Reasoning models (DeepSeek-R1, QwQ) keep their chain-of-thought
+                # in a separate field and only fill "content" with the final
+                # answer. If the budget was exhausted mid-reasoning, "content"
+                # is empty (the "received 0 chars" symptom). Surface WHY instead
+                # of failing silently.
+                if not content:
+                    finish = result["choices"][0].get("finish_reason", "")
+                    reasoning = (message.get("reasoning_content")
+                                 or message.get("reasoning") or "")
+                    if finish == "length":
+                        logger.warning(
+                            "LLM response hit the token limit "
+                            "(finish_reason=length) with empty content"
+                            + (" — only reasoning was produced. Raise max_tokens."
+                               if reasoning else ". Raise max_tokens.")
+                        )
+                    elif not reasoning:
+                        logger.warning(
+                            f"LLM returned empty content (finish_reason={finish!r})."
+                        )
+                return content
 
         raise Exception("LM Studio rejected input even after truncation. "
                        "Increase context length in LM Studio settings.")
