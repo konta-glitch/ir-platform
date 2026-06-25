@@ -30,7 +30,14 @@ class Settings(BaseSettings):
     # leaves headroom for reasoning + answer.
     llm_max_tokens: int = 16000
 
-    narrative_concurrency: int = 4
+    # How many narrative batches run at once. On a LOCAL single-GPU LLM (e.g.
+    # DeepSeek-R1 in LM Studio on an M-series Mac) concurrent calls share the
+    # same GPU and slow each other down, so high concurrency is counter-
+    # productive — 4 parallel batches each ran ~3-4x slower and some blew past
+    # the timeout. 2 keeps a little overlap without thrashing the GPU. Raise it
+    # only if you're pointing at a backend that genuinely serves requests in
+    # parallel (vLLM, a hosted API).
+    narrative_concurrency: int = 2
     # Findings per narrative batch. Smaller = more, shorter prompts (more
     # parallelism, less chance of hitting the model's output limit mid-JSON).
     narrative_batch_size: int = 20
@@ -49,9 +56,11 @@ class Settings(BaseSettings):
     llm_timeout: float = 600.0
 
     # Per-call timeout (seconds) for the narrative LLM calls. Reasoning models
-    # are slow, so the default 300s can cut them off mid-generation. Bumped for
-    # the narrative pass specifically.
-    narrative_timeout: float = 600.0
+    # are slow, and even at concurrency=2 a heavy batch can take ~10 min, so
+    # this is a generous safety margin above the typical batch time. Pair it
+    # with low narrative_concurrency — the timeout catches stragglers, it isn't
+    # a substitute for not thrashing the GPU.
+    narrative_timeout: float = 900.0
     # Severities sent to the narrative pass. IR default is ALL — nothing is
     # dropped. Set to "critical,high" to speed up at the cost of coverage.
     narrative_severities: str = "critical,high,medium,low,info"
