@@ -2200,7 +2200,7 @@ export default function App() {
   const handleResult = (data) => { setResult(data); fetchIncidents(); };
 
   return (
-    <div style={{ maxWidth: 920, margin: "0 auto", padding: "12px 16px", minHeight: "100vh" }}>
+    <div style={{ maxWidth: 1400, margin: "0 auto", padding: "12px 24px", minHeight: "100vh" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
         <div>
           <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600, letterSpacing: -.5 }}>
