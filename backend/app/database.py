@@ -37,10 +37,23 @@ class Database:
 
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Importing this module must not hard-fail just because the data dir
+        # can't be created (e.g. a bare CI runner where /app isn't writable).
+        # Try to make the dir; if that's impossible, fall back to an in-memory
+        # SQLite DB so imports/tests still work. In the container the dir is
+        # writable, so behaviour there is unchanged.
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn_target = str(self.db_path)
+        except OSError as e:
+            logger.warning(
+                f"Data dir {self.db_path.parent} unavailable ({e}); "
+                f"using in-memory database"
+            )
+            conn_target = ":memory:"
         # check_same_thread=False + a lock lets us share one connection across
         # the thread-pool workers that asyncio.to_thread uses.
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn = sqlite3.connect(conn_target, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._init_schema()
