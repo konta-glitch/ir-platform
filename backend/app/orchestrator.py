@@ -378,6 +378,32 @@ class Orchestrator:
     def update_incident(self, incident_id: str, **kwargs) -> Incident | None:
         return self.incidents.update(incident_id, **kwargs)
 
+    def triage_finding(self, incident_id: str, finding_id: str,
+                       verdict: str | None = None,
+                       note: str | None = None) -> Incident | None:
+        """Set or update one finding's triage (verdict and/or note).
+
+        Merges into the incident's finding_triage map rather than replacing it,
+        so marking one finding leaves the others untouched. Passing verdict
+        "clear" removes the finding's triage entry entirely.
+        """
+        from datetime import datetime
+        incident = self.incidents.get(incident_id)
+        if not incident:
+            return None
+        triage = dict(incident.finding_triage or {})
+        if verdict == "clear":
+            triage.pop(finding_id, None)
+        else:
+            entry = dict(triage.get(finding_id, {}))
+            if verdict is not None:
+                entry["verdict"] = verdict
+            if note is not None:
+                entry["note"] = note
+            entry["updated_at"] = datetime.utcnow().isoformat() + "Z"
+            triage[finding_id] = entry
+        return self.incidents.update(incident_id, finding_triage=triage)
+
     def delete_incident(self, incident_id: str) -> bool:
         self.agent.evict(incident_id)
         return self.incidents.delete(incident_id)

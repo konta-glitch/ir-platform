@@ -162,6 +162,7 @@ def generate_report(incident: Incident) -> dict:
         "knowledge_gaps": [],
         "cloud_enrichments": a.cloud_enrichments if a else [],
         "analyst_notes": incident.analyst_notes,
+        "finding_triage": incident.finding_triage or {},
         "detection_findings": findings,
         "detection_summary": incident.raw_artifacts.get("detection_summary", {}),
         "detection_statistics": incident.raw_artifacts.get("detection_statistics", {}),
