@@ -162,38 +162,48 @@ class LocalAnalyzer:
     async def generate_narrative(self, findings: list[dict],
                                   attack_chains: list[str],
                                   context: str = "",
-                                  batch_size: int = 20) -> dict:
+                                  batch_size: int = 0) -> dict:
         """
         Second LLM pass: generate an attack narrative + per-finding triage.
 
-        Only CRITICAL and HIGH severity findings are sent to the narrative
-        pass. MEDIUM/LOW findings are already captured in detection output —
-        the narrative LLM adds the most value on high-signal items where
-        attacker intent is clearest. This reduces batch count from ~19 to
-        ~5-8 for large collections, eliminating 504 timeouts and the
-        "Unterminated string" JSON parse failures caused by Mixtral hitting
-        its output limit mid-response.
+        Batches are processed CONCURRENTLY (asyncio) against the local LLM,
+        bounded by settings.narrative_concurrency, so wall-clock time scales
+        down roughly with the concurrency level instead of being the sum of
+        all batches. Batch ORDER is preserved in the merged result so the
+        narrative reads in sequence regardless of completion order.
 
-        Batch size is 20 (down from 40) to keep each prompt comfortably
-        inside Mixtral's context window even for verbose Sysmon findings.
+        Severity scope is configurable via settings.narrative_severities and
+        defaults to ALL severities — this is an IR tool, so nothing is dropped
+        from the narrative. (Set it to "critical,high" only if you explicitly
+        want to trade coverage for speed.)
         """
         if not findings:
             return {}
 
-        # Filter to CRITICAL + HIGH only for narrative pass.
-        NARRATIVE_SEVERITIES = {"critical", "high"}
+        from app.config import get_settings
+        import asyncio
+
+        settings = get_settings()
+        if not batch_size:
+            batch_size = settings.narrative_batch_size
+        concurrency = max(1, settings.narrative_concurrency)
+
+        # Severity scope — defaults to every severity (full coverage).
+        allowed = {
+            s.strip().lower()
+            for s in str(settings.narrative_severities).split(",")
+            if s.strip()
+        }
         narrative_findings = [
             f for f in findings
-            if str(f.get("severity", "")).lower() in NARRATIVE_SEVERITIES
+            if not allowed or str(f.get("severity", "")).lower() in allowed
         ]
-
-        # Fallback: if somehow nothing qualifies, use all findings
         if not narrative_findings:
             narrative_findings = findings
 
         logger.info(
             f"Narrative pass: {len(narrative_findings)} findings selected "
-            f"(critical/high) from {len(findings)} total"
+            f"(severities: {','.join(sorted(allowed)) or 'all'}) from {len(findings)} total"
         )
 
         # Cluster over the FULL finding set BEFORE batching so cross-batch
@@ -205,14 +215,16 @@ class LocalAnalyzer:
                 f"(e.g. multi-file tool installs) — will be flagged to the LLM per batch"
             )
 
-        batches = [narrative_findings[i:i + batch_size] for i in range(0, len(narrative_findings), batch_size)]
+        batches = [narrative_findings[i:i + batch_size]
+                   for i in range(0, len(narrative_findings), batch_size)]
         logger.info(
             f"Narrative pass: {len(narrative_findings)} findings in {len(batches)} batch(es) "
-            f"of up to {batch_size}"
+            f"of up to {batch_size}, concurrency={concurrency}"
         )
 
-        batch_results = []
-        for batch_num, batch in enumerate(batches, start=1):
+        sem = asyncio.Semaphore(concurrency)
+
+        async def run_batch(batch_num: int, batch: list[dict]):
             batch_ids = {f["id"] for f in batch}
             # Only pass clusters that have at least one member in THIS batch —
             # a cluster split across batches still gets mentioned in each
@@ -221,13 +233,25 @@ class LocalAnalyzer:
             relevant_clusters = [
                 c for c in all_clusters if batch_ids & set(c["finding_ids"])
             ]
-            result = await self._generate_narrative_batch(
-                batch, attack_chains, context,
-                batch_num=batch_num, total_batches=len(batches),
-                clusters=relevant_clusters,
-            )
-            if result:
-                batch_results.append(result)
+            async with sem:
+                return await self._generate_narrative_batch(
+                    batch, attack_chains, context,
+                    batch_num=batch_num, total_batches=len(batches),
+                    clusters=relevant_clusters,
+                )
+
+        # Launch all batches; gather preserves input order, so batch_results
+        # stays in narrative sequence even though they finish out of order.
+        tasks = [run_batch(i, b) for i, b in enumerate(batches, start=1)]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        batch_results = []
+        for i, res in enumerate(gathered, start=1):
+            if isinstance(res, Exception):
+                logger.error(f"Narrative batch {i} failed: {res}")
+                continue
+            if res:
+                batch_results.append(res)
 
         if not batch_results:
             return {}
@@ -375,17 +399,39 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
     def _parse_json(self, text: str) -> dict:
         """Safely parse JSON from LLM output."""
         cleaned = text.strip()
+
+        # Reasoning models (DeepSeek-R1, QwQ, etc.) emit a <think>...</think>
+        # chain-of-thought block BEFORE the actual answer. That block is prose,
+        # often containing stray '{' '}' characters, so it both (a) makes the
+        # response not start with JSON and (b) confuses a greedy { ... } regex
+        # into grabbing the wrong span. Strip it before doing anything else.
+        # Handles a closed block, and the degenerate case where the model only
+        # opened <think> and we keep everything after it.
+        if "<think>" in cleaned:
+            if "</think>" in cleaned:
+                cleaned = cleaned.split("</think>", 1)[1].strip()
+            else:
+                cleaned = cleaned.split("<think>", 1)[1].strip()
+
+        # Strip ```json fences if present.
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
             cleaned = re.sub(r"\s*```$", "", cleaned)
+
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as e:
             logger.warning(f"JSON parse failed: {e}")
-            # Try to extract JSON from the text
-            match = re.search(r'\{[\s\S]*\}', cleaned)
-            if match:
-                candidate = match.group()
+            # Prefer a brace-balanced extraction over a greedy regex: scan for
+            # the first '{' and walk to its matching '}', respecting strings
+            # and escapes. This survives reasoning text or trailing prose that
+            # contains unbalanced braces, which the old r'\{[\s\S]*\}' caught
+            # wrongly (it grabbed from the first '{' to the LAST '}' anywhere).
+            candidate = self._extract_balanced_json(cleaned)
+            if candidate is None:
+                match = re.search(r'\{[\s\S]*\}', cleaned)
+                candidate = match.group() if match else None
+            if candidate:
                 try:
                     return json.loads(candidate)
                 except json.JSONDecodeError as e2:
@@ -410,6 +456,57 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
                         except json.JSONDecodeError:
                             pass
             return {}
+
+    @staticmethod
+    def _extract_balanced_json(text: str) -> str | None:
+        """
+        Return the first brace-balanced {...} span that actually parses as
+        JSON, or None.
+
+        Reasoning text before the real answer can contain balanced-but-junk
+        braces like '{stray}'. So we don't just return the first balanced
+        span — we try each candidate (scanning successive '{' positions) and
+        return the first one json.loads() accepts. This skips prose braces and
+        lands on the real object.
+        """
+        search_from = 0
+        while True:
+            start = text.find("{", search_from)
+            if start == -1:
+                return None
+            depth = 0
+            in_string = False
+            escape_next = False
+            end = -1
+            for i in range(start, len(text)):
+                ch = text[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\":
+                    escape_next = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end != -1:
+                candidate = text[start:end + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate  # parses cleanly — this is the one
+                except json.JSONDecodeError:
+                    pass  # balanced but not valid JSON (e.g. '{stray}') — keep looking
+            # Advance past this '{' and try the next candidate.
+            search_from = start + 1
 
     @staticmethod
     def _escape_control_chars_in_strings(text: str) -> str:

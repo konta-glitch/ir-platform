@@ -37,7 +37,7 @@ jobs:
           python -m pip install --upgrade pip
           grep -vE 'sentence-transformers|chromadb' requirements.txt > ci-requirements.txt
           pip install -r ci-requirements.txt
-          pip install pytest
+          pip install pytest pytest-asyncio
 
       - name: Run tests
         run: pytest

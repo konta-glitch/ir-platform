@@ -16,6 +16,20 @@ class Settings(BaseSettings):
     data_dir: str = "/app/data"
     export_dir: str = "/app/exports"
 
+    # ── Narrative pass (second LLM pass) ──
+    # How many narrative batches run concurrently against the local LLM. The
+    # batches are independent, so running them in parallel cuts wall-clock time
+    # roughly N-fold. Cap it to what your LLM server can handle without
+    # thrashing — LM Studio with one loaded model handles 2-4 well; raise if
+    # you run a server that batches requests. 1 = old sequential behaviour.
+    narrative_concurrency: int = 4
+    # Findings per narrative batch. Smaller = more, shorter prompts (more
+    # parallelism, less chance of hitting the model's output limit mid-JSON).
+    narrative_batch_size: int = 20
+    # Severities sent to the narrative pass. IR default is ALL — nothing is
+    # dropped. Set to "critical,high" to speed up at the cost of coverage.
+    narrative_severities: str = "critical,high,medium,low,info"
+
     class Config:
         env_file = ".env"
 
