@@ -241,6 +241,11 @@ class DetectionEngine:
                      description: str, artifact: str, evidence: dict,
                      score: int = 0, mitre: str = ""):
         """Record a finding with evidence pointer. Called by every detector module."""
+        # Normalise severity through the Severity enum so an unexpected value
+        # (e.g. a typo, or "informational" vs "info") becomes a canonical label
+        # instead of silently corrupting sorting and the critical/high counts.
+        from app.detection.types import Severity
+        severity = Severity.parse(severity).label
         finding_id = f"F{len(self.findings) + 1:04d}"
         self.findings.append({
             "id": finding_id,
@@ -312,8 +317,8 @@ class DetectionEngine:
         self._enrich_source_files(data)
         self._deduplicate_findings()
 
-        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-        self.findings.sort(key=lambda f: (sev_order.get(f["severity"], 5), -f.get("score", 0)))
+        from app.detection.types import severity_sort_key
+        self.findings.sort(key=lambda f: (severity_sort_key(f["severity"]), -f.get("score", 0)))
 
         coverage = {
             "artifacts_scanned": len(artifacts),

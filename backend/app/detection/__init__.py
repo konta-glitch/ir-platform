@@ -49,6 +49,7 @@ from app.detection.execution_evidence import (
 )
 from app.detection.file_anomalies import detect_file_anomalies
 from app.detection.yara_findings import detect_yara_matches
+from app.detection.hash_reputation import detect_hash_reputation
 from app.detection.generic import detect_generic  # noqa: F401 — used as fallback in base.py
 from app.detection.textlogs import detect_textlogs
 
@@ -83,6 +84,15 @@ register_route(["searchglobs", "matches", "metadata", "upload"], detect_file_ano
 # same artifact key — auth-pattern analysis runs whenever an eventlog
 # route fires, without replacing detect_eventlogs's own brute-force check.
 register_additional_pass(["evtx", "eventlog", "event", "logon"], detect_auth_patterns)
+# Hash/IOC reputation runs alongside whichever primary detector handled a
+# hash-bearing artifact (processes, file listings, YARA matches). A hash match
+# is identity-level evidence, so it corroborates the path/content heuristics
+# those primary detectors emit. No-op when no local IOC feed is present.
+register_additional_pass(
+    ["pslist", "process", "pstree", "matches", "searchglobs", "metadata",
+     "upload", "yara_matches", "yara", "amcache", "prefetch"],
+    detect_hash_reputation,
+)
 # Text-based log formats: syslog, Apache/Nginx, Zeek, Suricata EVE, CSV/SIEM
 register_route(
     ["syslog", "authlog", "auth_log", "apache", "nginx", "iis",
