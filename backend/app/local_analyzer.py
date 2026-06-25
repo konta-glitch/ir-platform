@@ -132,11 +132,15 @@ class LocalAnalyzer:
 
     async def _call_llm(self, system: str, user: str,
                         temperature: float = 0.1,
-                        max_tokens: int = 0) -> str:
+                        max_tokens: int = 0,
+                        timeout: float = 0.0) -> str:
         """Call the local LLM via LM Studio (auto-detects API format)."""
         if not max_tokens:
             from app.config import get_settings
             max_tokens = get_settings().llm_max_tokens
+        kwargs = {}
+        if timeout:
+            kwargs["timeout"] = timeout
         return await self.lm.chat(
             messages=[
                 {"role": "system", "content": system},
@@ -144,6 +148,7 @@ class LocalAnalyzer:
             ],
             temperature=temperature,
             max_tokens=max_tokens,
+            **kwargs,
         )
 
     async def chat_messages(self, messages: list[dict],
@@ -334,6 +339,15 @@ Critical guidance to avoid false positives:
   severity label alone determine how much attention a finding gets in your narrative.
 - Reference finding IDs in brackets. Technical but readable. Output ONLY valid JSON."""
 
+        # Reasoning models otherwise spend the whole token budget "thinking"
+        # and never emit the JSON. For the narrative pass (formatting, not deep
+        # reasoning) tell them to answer directly. Harmless for non-reasoning
+        # models, which ignore the directive.
+        from app.config import get_settings
+        _settings = get_settings()
+        if _settings.narrative_disable_thinking:
+            system += "\n/no_think"
+
         user = f"""Analyst context: {context}
 
 Detected attack chains:
@@ -351,7 +365,10 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
                 f"Narrative pass batch {batch_num}/{total_batches}: "
                 f"analyzing {len(findings)} findings via LLM"
             )
-            raw = await self._call_llm(system, user, temperature=0.2)
+            raw = await self._call_llm(
+                system, user, temperature=0.2,
+                timeout=_settings.narrative_timeout,
+            )
             result = self._parse_json(raw)
             if result:
                 logger.info(f"Narrative pass batch {batch_num}/{total_batches}: generated narrative")
