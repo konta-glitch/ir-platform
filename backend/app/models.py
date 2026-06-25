@@ -177,6 +177,11 @@ class Incident(BaseModel):
     affected_hosts:         list[str]      = []
     description:            str            = ""
     analyst_notes:          str            = ""
+    # Per-finding triage layer, keyed by finding id → {verdict, note,
+    # updated_at}. Verdict is one of: true_positive, false_positive, benign,
+    # needs_review. Sits on top of the detection findings (which live in
+    # raw_artifacts) so marking a finding never mutates the detection output.
+    finding_triage:         dict[str, Any] = {}
     analysis:               AnalysisResult | None          = None
     escalation:             EscalationDecision | None      = None
     anonymization_mappings: list[AnonymizationMapping]     = []

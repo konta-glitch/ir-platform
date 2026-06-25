@@ -513,10 +513,50 @@ function ReportView({ incidentId, onBack }) {
     setChatMessages([]);
   };
 
+  // ── Finding triage ──
+  // Verdict map keyed by finding id, seeded from the report and updated
+  // optimistically so marking a finding feels instant.
+  const [triage, setTriage] = useState({});
+  const [triageFilter, setTriageFilter] = useState("all");
+  const [noteDraft, setNoteDraft] = useState({}); // finding_id -> in-progress note text
+
+  const markFinding = async (findingId, verdict) => {
+    // Optimistic update; reconcile with server response.
+    setTriage(prev => {
+      const next = { ...prev };
+      if (verdict === "clear") delete next[findingId];
+      else next[findingId] = { ...(next[findingId] || {}), verdict };
+      return next;
+    });
+    try {
+      const form = new FormData();
+      form.append("verdict", verdict);
+      const r = await fetch(`${API}/incidents/${incidentId}/findings/${findingId}/triage`,
+        { method: "POST", body: form });
+      const d = await r.json();
+      if (r.ok) setTriage(prev => ({ ...prev, [findingId]: d.triage }));
+    } catch { /* keep optimistic state */ }
+  };
+
+  const saveNote = async (findingId) => {
+    const note = (noteDraft[findingId] ?? "").trim();
+    try {
+      const form = new FormData();
+      form.append("note", note);
+      const r = await fetch(`${API}/incidents/${incidentId}/findings/${findingId}/triage`,
+        { method: "POST", body: form });
+      const d = await r.json();
+      if (r.ok) {
+        setTriage(prev => ({ ...prev, [findingId]: d.triage }));
+        setNoteDraft(prev => { const n = { ...prev }; delete n[findingId]; return n; });
+      }
+    } catch { /* ignore */ }
+  };
+
   const loadReport = () => {
     fetch(`${API}/incidents/${incidentId}/report`)
       .then(r => r.ok ? r.json() : null)
-      .then(d => { setReport(d); setLoading(false); })
+      .then(d => { setReport(d); if (d?.finding_triage) setTriage(d.finding_triage); setLoading(false); })
       .catch(() => setLoading(false));
   };
   useEffect(loadReport, [incidentId]);
@@ -1056,8 +1096,42 @@ function ReportView({ incidentId, onBack }) {
             </div>
           )}
 
+          {/* Triage filter — work through findings by verdict */}
+          {(() => {
+            const counts = { all: report.detection_findings.length, untriaged: 0,
+              true_positive: 0, false_positive: 0, benign: 0, needs_review: 0 };
+            for (const f of report.detection_findings) {
+              const v = triage[f.id]?.verdict;
+              if (!v) counts.untriaged++; else if (counts[v] != null) counts[v]++;
+            }
+            const filters = [
+              ["all", "All", C.muted], ["untriaged", "Untriaged", C.dim],
+              ["true_positive", "True positive", C.red],
+              ["false_positive", "False positive", C.green],
+              ["benign", "Benign", C.blue], ["needs_review", "Needs review", C.amber],
+            ];
+            return (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+                {filters.map(([key, label, col]) => (
+                  <button key={key} onClick={() => setTriageFilter(key)} style={{
+                    padding: "4px 11px", borderRadius: 20, fontSize: 11, cursor: "pointer",
+                    fontWeight: triageFilter === key ? 600 : 400,
+                    border: `1px solid ${triageFilter === key ? col : C.border2}`,
+                    background: triageFilter === key ? col + "22" : "transparent",
+                    color: triageFilter === key ? col : C.muted,
+                  }}>{label} <span style={{ opacity: .7 }}>{counts[key]}</span></button>
+                ))}
+              </div>
+            );
+          })()}
+
           <div style={{ display: "grid", gap: 6 }}>
-            {report.detection_findings.slice(0, 100).map((f) => {
+            {report.detection_findings.slice(0, 100).filter((f) => {
+              if (triageFilter === "all") return true;
+              const v = triage[f.id]?.verdict;
+              if (triageFilter === "untriaged") return !v;
+              return v === triageFilter;
+            }).map((f) => {
               const sevColor = { critical: C.red, high: C.coral, medium: C.amber, low: C.blue, info: C.dim }[f.severity] || C.dim;
               return (
                 <details key={f.id} style={{ padding: "10px 14px", borderRadius: 8, background: C.surface2, borderLeft: `3px solid ${sevColor}` }}>
@@ -1070,6 +1144,12 @@ function ReportView({ incidentId, onBack }) {
                       )}
                     </span>
                     <span style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+                      {triage[f.id]?.verdict && (() => {
+                        const v = triage[f.id].verdict;
+                        const vc = { true_positive: C.red, false_positive: C.green, benign: C.blue, needs_review: C.amber }[v] || C.dim;
+                        const vl = { true_positive: "TP", false_positive: "FP", benign: "benign", needs_review: "review" }[v] || v;
+                        return <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 10, fontWeight: 700, textTransform: "uppercase", background: vc + "22", color: vc, border: `1px solid ${vc}55` }}>{vl}</span>;
+                      })()}
                       {f.mitre && <code style={{ fontSize: 10, color: C.accent }}>{f.mitre}</code>}
                       <span style={{ fontSize: 9, padding: "1px 8px", borderRadius: 10, textTransform: "uppercase", fontWeight: 600, background: sevColor + "22", color: sevColor }}>{f.severity}</span>
                     </span>
@@ -1108,6 +1188,45 @@ function ReportView({ incidentId, onBack }) {
                         </div>
                       );
                     })()}
+                    {/* Triage controls */}
+                    <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
+                      <div style={{ fontSize: 10, color: C.dim, textTransform: "uppercase", letterSpacing: .5, marginBottom: 6 }}>Analyst verdict</div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+                        {[["true_positive", "True positive", C.red],
+                          ["false_positive", "False positive", C.green],
+                          ["benign", "Benign", C.blue],
+                          ["needs_review", "Needs review", C.amber]].map(([v, label, col]) => {
+                          const active = triage[f.id]?.verdict === v;
+                          return (
+                            <button key={v} onClick={() => markFinding(f.id, active ? "clear" : v)} style={{
+                              padding: "4px 11px", borderRadius: 6, fontSize: 11, cursor: "pointer",
+                              fontWeight: active ? 600 : 400,
+                              border: `1px solid ${active ? col : C.border2}`,
+                              background: active ? col + "22" : "transparent",
+                              color: active ? col : C.muted,
+                            }}>{label}</button>
+                          );
+                        })}
+                      </div>
+                      <div style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
+                        <textarea
+                          value={noteDraft[f.id] ?? triage[f.id]?.note ?? ""}
+                          onChange={e => setNoteDraft(prev => ({ ...prev, [f.id]: e.target.value }))}
+                          placeholder="Add a note (what you checked, why this verdict)…"
+                          style={{ flex: 1, minHeight: 38, padding: "7px 10px", borderRadius: 6,
+                            border: `1px solid ${C.border}`, background: C.bg, color: C.text,
+                            fontSize: 12, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box" }}
+                        />
+                        {noteDraft[f.id] != null && noteDraft[f.id] !== (triage[f.id]?.note ?? "") && (
+                          <Btn variant="primary" onClick={() => saveNote(f.id)} style={{ fontSize: 11, padding: "6px 12px" }}>Save</Btn>
+                        )}
+                      </div>
+                      {triage[f.id]?.updated_at && (
+                        <div style={{ fontSize: 10, color: C.dim, marginTop: 4 }}>
+                          Marked {new Date(triage[f.id].updated_at).toLocaleString()}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </details>
               );

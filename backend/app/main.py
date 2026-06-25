@@ -23,6 +23,7 @@ from app.orchestrator import Orchestrator
 from app.collector import CollectorManager
 from app.image_analyzer import ImageAnalyzer
 from app.report_generator import generate_report, generate_markdown
+from app.html_report import generate_html
 from app.progress import get_tracker, STAGES
 from app.structured_logging import setup_logging, get_audit_logger
 from app.config import get_settings as _gs
@@ -692,6 +693,30 @@ async def update_incident(
     return incident.model_dump()
 
 
+@app.post("/api/incidents/{incident_id}/findings/{finding_id}/triage")
+async def triage_finding(
+    incident_id: str,
+    finding_id: str,
+    verdict: str | None = Form(None),
+    note: str | None = Form(None),
+):
+    """Set a finding's analyst verdict and/or note.
+
+    verdict ∈ {true_positive, false_positive, benign, needs_review, clear}.
+    "clear" removes the triage entry. Either field may be sent on its own, so
+    the UI can update a verdict and a note independently.
+    """
+    valid = {"true_positive", "false_positive", "benign", "needs_review", "clear", None}
+    if verdict not in valid:
+        raise HTTPException(400, f"Invalid verdict: {verdict}")
+    incident = orchestrator.triage_finding(
+        incident_id, finding_id, verdict=verdict, note=note,
+    )
+    if not incident:
+        raise HTTPException(404, "Incident not found")
+    return {"finding_id": finding_id, "triage": incident.finding_triage.get(finding_id, {})}
+
+
 @app.post("/api/incidents/{incident_id}/deanonymize")
 async def deanonymize_report(incident_id: str):
     result = orchestrator.deanonymize_report(incident_id)
@@ -759,6 +784,30 @@ async def download_incident_report(incident_id: str):
         media_type="text/markdown",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/api/incidents/{incident_id}/report/html")
+async def get_incident_report_html(incident_id: str, download: bool = False):
+    """Render the incident report as a styled, self-contained HTML document.
+
+    Same data as the Markdown/JSON report, but as a single shareable file with
+    an executive/technical toggle and client-side finding filters. Pass
+    ?download=true to get it as an attachment instead of inline.
+    """
+    incident = orchestrator.get_incident(incident_id)
+    if not incident:
+        raise HTTPException(404, "Incident not found")
+
+    from fastapi.responses import HTMLResponse, Response
+    report = generate_report(incident)
+    page = generate_html(report)
+    if download:
+        return Response(
+            content=page,
+            media_type="text/html",
+            headers={"Content-Disposition": f'attachment; filename="IR-{incident_id}-report.html"'},
+        )
+    return HTMLResponse(content=page)
 @app.get("/api/incidents/{incident_id}/search")
 async def rag_search(incident_id: str, q: str, top_k: int = 15):
     """Semantic search over incident findings."""
