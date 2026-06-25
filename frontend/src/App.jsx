@@ -626,7 +626,7 @@ function ReportView({ incidentId, onBack }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {/* Header */}
+      {/* Header (full width) */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <Btn variant="ghost" onClick={onBack}>← Back</Btn>
         <a href={`${API}/incidents/${incidentId}/report/download`} download
@@ -634,6 +634,16 @@ function ReportView({ incidentId, onBack }) {
           Download report (.md)
         </a>
       </div>
+
+      {/* Two-column workspace: report on the left, sticky agent chat on the
+          right so the analyst can read findings and ask the agent without
+          scrolling between them. Collapses to one column on narrow screens. */}
+      <div className="ir-workspace" style={{
+        display: "grid", gridTemplateColumns: "minmax(0, 1fr) 380px",
+        gap: 16, alignItems: "start",
+      }}>
+        {/* LEFT: report content */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16, minWidth: 0 }}>
 
       {/* Cover */}
       <Card style={{ borderTop: `3px solid ${sevColor}` }}>
@@ -808,96 +818,7 @@ function ReportView({ incidentId, onBack }) {
         )}
       </Card>
 
-      {/* Conversational chat with the agent */}
-      <Card>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 500 }}>Ask the agent</h3>
-          {chatMessages.length > 0 && (
-            <button onClick={clearChat}
-              style={{ background: "none", border: "none", color: C.dim, cursor: "pointer", fontSize: 11 }}>
-              Clear chat
-            </button>
-          )}
-        </div>
-        <p style={{ margin: "0 0 12px", fontSize: 12, color: C.dim, lineHeight: 1.6 }}>
-          Ask questions in plain language. The agent queries the real data and remembers context,
-          so you can follow up ("what about that IP?", "show me more on F0003").
-        </p>
-
-        {/* Message thread */}
-        {chatMessages.length > 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 12,
-                        maxHeight: 420, overflowY: "auto", padding: "4px 2px" }}>
-            {chatMessages.map((msg, i) => (
-              <div key={i} style={{
-                alignSelf: msg.role === "user" ? "flex-end" : "flex-start",
-                maxWidth: "85%",
-              }}>
-                <div style={{
-                  padding: "8px 14px", borderRadius: 12, fontSize: 13, lineHeight: 1.6,
-                  background: msg.role === "user" ? C.accent + "22" : (msg.error ? C.red + "15" : C.surface2),
-                  color: msg.error ? C.coral : C.text,
-                  border: msg.role === "user" ? `1px solid ${C.accent}33` : `1px solid ${C.border}33`,
-                  whiteSpace: "pre-wrap",
-                }}>
-                  {msg.content}
-                </div>
-                {/* Tool steps the agent took to answer */}
-                {msg.steps?.length > 0 && (
-                  <div style={{ marginTop: 4, marginLeft: 4 }}>
-                    {msg.steps.map((s, j) => (
-                      <span key={j} title={s.thought} style={{
-                        display: "inline-block", marginRight: 4, marginTop: 2,
-                        fontSize: 10, padding: "1px 7px", borderRadius: 5,
-                        background: C.bg, color: C.dim, fontFamily: "monospace", cursor: "default",
-                      }}>{s.action}({s.result_summary})</span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
-            {chatBusy && (
-              <div style={{ alignSelf: "flex-start", display: "flex", alignItems: "center", gap: 8,
-                            fontSize: 12, color: C.accent, padding: "4px 8px" }}>
-                <span className="pulse" style={{ width: 6, height: 6, borderRadius: "50%", background: C.accent }} />
-                Agent querying the data...
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Input */}
-        <div style={{ display: "flex", gap: 8 }}>
-          <input
-            value={chatInput}
-            onChange={e => setChatInput(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } }}
-            placeholder="Ask about findings, IOCs, processes, timeline..."
-            disabled={chatBusy}
-            style={{ flex: 1, padding: "9px 14px", borderRadius: 8, border: `1px solid ${C.border}`,
-                     background: C.bg, color: C.text, fontSize: 13 }}
-          />
-          <Btn onClick={sendChat} disabled={chatBusy || !chatInput.trim()}>Send</Btn>
-        </div>
-
-        {/* Suggested starter questions */}
-        {chatMessages.length === 0 && (
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
-            {[
-              "What are the most critical findings?",
-              "Is there evidence of lateral movement?",
-              "Were any credentials accessed?",
-              "Walk me through the attack timeline",
-            ].map((q, i) => (
-              <button key={i} onClick={() => setChatInput(q)}
-                style={{ fontSize: 11, padding: "4px 10px", borderRadius: 14, cursor: "pointer",
-                         background: C.surface2, color: C.muted, border: `1px solid ${C.border}33` }}>
-                {q}
-              </button>
-            ))}
-          </div>
-        )}
-      </Card>
+      {/* Conversational chat moved to the right panel (see below) */}
 
       {/* Entity connectivity graph */}
       <EntityGraph incidentId={incidentId} />
@@ -1413,6 +1334,99 @@ function ReportView({ incidentId, onBack }) {
           ))}
         </Card>
       )}
+        </div>{/* end LEFT column */}
+
+        {/* RIGHT: sticky agent chat panel */}
+        <div className="ir-chat-rail" style={{ position: "sticky", top: 16, alignSelf: "start" }}>
+          <Card style={{ display: "flex", flexDirection: "column", maxHeight: "calc(100vh - 32px)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <h3 style={{ margin: 0, fontSize: 15, fontWeight: 500 }}>Ask the agent</h3>
+              {chatMessages.length > 0 && (
+                <button onClick={clearChat}
+                  style={{ background: "none", border: "none", color: C.dim, cursor: "pointer", fontSize: 11 }}>
+                  Clear chat
+                </button>
+              )}
+            </div>
+            <p style={{ margin: "0 0 12px", fontSize: 12, color: C.dim, lineHeight: 1.6 }}>
+              Plain-language questions. The agent queries the real data and remembers
+              context, so you can follow up ("what about that IP?", "more on F0003").
+            </p>
+
+            {/* Message thread — grows to fill the panel, scrolls internally */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 12,
+                          flex: 1, overflowY: "auto", minHeight: chatMessages.length ? 120 : 0,
+                          padding: "4px 2px" }}>
+              {chatMessages.map((msg, i) => (
+                <div key={i} style={{
+                  alignSelf: msg.role === "user" ? "flex-end" : "flex-start",
+                  maxWidth: "90%",
+                }}>
+                  <div style={{
+                    padding: "8px 14px", borderRadius: 12, fontSize: 13, lineHeight: 1.6,
+                    background: msg.role === "user" ? C.accent + "22" : (msg.error ? C.red + "15" : C.surface2),
+                    color: msg.error ? C.coral : C.text,
+                    border: msg.role === "user" ? `1px solid ${C.accent}33` : `1px solid ${C.border}33`,
+                    whiteSpace: "pre-wrap",
+                  }}>
+                    {msg.content}
+                  </div>
+                  {msg.steps?.length > 0 && (
+                    <div style={{ marginTop: 4, marginLeft: 4 }}>
+                      {msg.steps.map((s, j) => (
+                        <span key={j} title={s.thought} style={{
+                          display: "inline-block", marginRight: 4, marginTop: 2,
+                          fontSize: 10, padding: "1px 7px", borderRadius: 5,
+                          background: C.bg, color: C.dim, fontFamily: "monospace", cursor: "default",
+                        }}>{s.action}({s.result_summary})</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+              {chatBusy && (
+                <div style={{ alignSelf: "flex-start", display: "flex", alignItems: "center", gap: 8,
+                              fontSize: 12, color: C.accent, padding: "4px 8px" }}>
+                  <span className="pulse" style={{ width: 6, height: 6, borderRadius: "50%", background: C.accent }} />
+                  Agent querying the data...
+                </div>
+              )}
+            </div>
+
+            {/* Input (pinned at the bottom of the panel) */}
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } }}
+                placeholder="Ask about findings, IOCs..."
+                disabled={chatBusy}
+                style={{ flex: 1, padding: "9px 14px", borderRadius: 8, border: `1px solid ${C.border}`,
+                         background: C.bg, color: C.text, fontSize: 13, minWidth: 0 }}
+              />
+              <Btn onClick={sendChat} disabled={chatBusy || !chatInput.trim()}>Send</Btn>
+            </div>
+
+            {/* Suggested starters (only before the first message) */}
+            {chatMessages.length === 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+                {[
+                  "Most critical findings?",
+                  "Evidence of lateral movement?",
+                  "Were credentials accessed?",
+                  "Walk me through the timeline",
+                ].map((q, i) => (
+                  <button key={i} onClick={() => setChatInput(q)}
+                    style={{ fontSize: 11, padding: "4px 10px", borderRadius: 14, cursor: "pointer",
+                             background: C.surface2, color: C.muted, border: `1px solid ${C.border}33` }}>
+                    {q}
+                  </button>
+                ))}
+              </div>
+            )}
+          </Card>
+        </div>{/* end RIGHT chat rail */}
+      </div>{/* end workspace grid */}
     </div>
   );
 }
