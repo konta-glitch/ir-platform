@@ -39,11 +39,10 @@ logger = logging.getLogger(__name__)
 # C2-port connection AND a persistence mechanism".
 MIN_CORROBORATING_CATEGORIES = 2
 
-# Cumulative score threshold to emit a summary finding. Deliberately above
-# what a single strong finding alone would produce (most individual
-# findings here score 40-95), so this fires on genuine MULTI-SIGNAL
-# corroboration, not as a duplicate of an existing high/critical finding.
-RISK_SCORE_THRESHOLD = 130
+# Cumulative score threshold to emit a summary finding lives in the central
+# thresholds module now (see detection/thresholds.py) so all tuning constants
+# sit in one place. Re-exported here under the original name for callers.
+from app.detection.thresholds import RISK_SCORE_THRESHOLD
 
 
 def _entity_keys(finding: dict) -> list[tuple[str, str]]:

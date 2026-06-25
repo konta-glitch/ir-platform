@@ -197,28 +197,39 @@ class SigmaRule:
         "scriptblocktext",
     }
 
+    def could_match_fields(self, row_fields: set) -> bool:
+        """
+        Cheap field-presence pre-check, given a row's lowercased field-name set.
+
+        Returns False when this rule provably cannot match the row (no shared
+        inspected field, or a missing discriminator field). The caller computes
+        `row_fields` ONCE per row and reuses it across all rules, avoiding the
+        per-rule recomputation that match_row() would otherwise do on every
+        (row x rule) pair. This is a pure performance gate — it never turns a
+        non-match into a match, so detection results are identical.
+        """
+        req = self.required_fields()
+        if req:
+            if not (req & row_fields) and not self._has_aliased_field(req, row_fields):
+                return False
+        rule_discriminators = req & self.DISCRIMINATOR_FIELDS
+        if rule_discriminators:
+            if not (self.DISCRIMINATOR_ALIASES & row_fields):
+                return False
+        return True
+
     def match_row(self, row: dict) -> bool:
         """Evaluate this rule's detection logic against a single row."""
         if not isinstance(row, dict):
             return False
 
-        req = self.required_fields()
         row_fields = {str(k).lower() for k in row.keys()}
 
-        # Fast pre-filter: if the row shares NONE of the fields this rule
-        # inspects, it can't match — skip the expensive evaluation.
-        if req:
-            if not (req & row_fields) and not self._has_aliased_field(req, row_fields):
-                return False
-
-        # Discriminator guard: if this rule depends on a high-signal field
-        # (command line, parent, loaded image, script block) but the row has
-        # NONE of those, the only way it could "match" is on the bare image
-        # name — too weak, and the source of the PsList false positives.
-        rule_discriminators = req & self.DISCRIMINATOR_FIELDS
-        if rule_discriminators:
-            if not (self.DISCRIMINATOR_ALIASES & row_fields):
-                return False
+        # Fast pre-filter (shared with the engine's per-row gate): if the row
+        # can't possibly satisfy this rule's field requirements, skip the
+        # expensive selection/condition evaluation.
+        if not self.could_match_fields(row_fields):
+            return False
 
         # Evaluate each named selection block
         selection_results = {}
@@ -525,9 +536,9 @@ class SigmaEngine:
         # COULD be malicious", not "this IS an attack". We cap Sigma severity
         # at HIGH (never auto-critical) so a single uncorroborated rule can't
         # dominate the report, and tag findings as needing corroboration.
-        sev_map = {"critical": "high", "high": "high",
-                   "medium": "medium", "low": "low", "informational": "info"}
-        score_map = {"critical": 70, "high": 60, "medium": 45, "low": 25}
+        from app.detection.thresholds import SIGMA_SEVERITY_CAP, SIGMA_SCORE_BY_LEVEL
+        sev_map = SIGMA_SEVERITY_CAP
+        score_map = SIGMA_SCORE_BY_LEVEL
 
         # Bulk file-metadata artifacts: scanned by detection_engine, not Sigma
         # (Sigma event/process rules cannot match file-listing rows).
@@ -559,15 +570,24 @@ class SigmaEngine:
 
             # Iterate rows in outer loop (each row tested against all rules),
             # so we touch each row once and can early-exit per rule via counts.
+            # PERF: compute the row's field-name set ONCE here and reuse it for
+            # every rule's cheap pre-filter, instead of recomputing it inside
+            # each match_row() call. At ~3k rules x thousands of rows this turns
+            # millions of redundant set-builds into one per row. Logic is
+            # unchanged: could_match_fields() is the same gate match_row() uses.
             rule_match_counts = {}
             for idx, row in enumerate(scan_rows):
                 if not isinstance(row, dict):
                     continue
+                row_fields = {str(k).lower() for k in row.keys()}
                 for rule in applicable:
                     rid = id(rule)
                     count = rule_match_counts.get(rid, 0)
                     if count > max_matches_per_rule:
                         continue  # already have enough samples from this rule
+                    # Cheap field-presence gate before the expensive eval.
+                    if not rule.could_match_fields(row_fields):
+                        continue
                     if rule.match_row(row):
                         rule_match_counts[rid] = count + 1
                         if count < max_matches_per_rule:
