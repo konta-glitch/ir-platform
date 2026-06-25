@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # true, append a no-think directive to the narrative prompt so the model
     # answers directly. The primary analysis pass still reasons normally.
     narrative_disable_thinking: bool = True
+    # Default per-call timeout (seconds) for LLM calls. The 300s httpx default
+    # cuts off slow reasoning models (DeepSeek-R1 spends ~170s just thinking on
+    # the main analysis pass, plus prompt processing + generation). This is the
+    # baseline used by the primary analysis and enrichment passes; the
+    # narrative pass uses its own (longer) narrative_timeout below.
+    llm_timeout: float = 600.0
+
     # Per-call timeout (seconds) for the narrative LLM calls. Reasoning models
     # are slow, so the default 300s can cut them off mid-generation. Bumped for
     # the narrative pass specifically.
