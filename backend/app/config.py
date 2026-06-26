@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     # with low narrative_concurrency — the timeout catches stragglers, it isn't
     # a substitute for not thrashing the GPU.
     narrative_timeout: float = 900.0
+    # After per-batch narratives are written, run ONE more pass that reads the
+    # batch narratives + key findings and writes a single coherent incident
+    # story — so related activity split across batches reads as one attack, not
+    # N stitched-together sections. The per-batch results are kept as a fallback
+    # if synthesis fails or is disabled. Off → the old concatenated-sections
+    # behaviour. One extra LLM call (small prompt: it summarises summaries).
+    narrative_synthesize: bool = True
     # Severities sent to the narrative pass. IR default is ALL — nothing is
     # dropped. Set to "critical,high" to speed up at the cost of coverage.
     narrative_severities: str = "critical,high,medium,low,info"

@@ -135,4 +135,114 @@ def _cluster_findings_by_folder(findings: list[dict]) -> list[dict]:
     return clusters
 
 
+def _finding_entities(f: dict) -> set[str]:
+    """Pull the concrete entities a finding touches — process name, IP, user,
+    file — so two findings about the same artefact can be linked even when they
+    sit in different folders or have different MITRE ids. Best-effort over the
+    fields detections actually carry."""
+    ents: set[str] = set()
+    ev = f.get("evidence", {}) or {}
+    for key in ("process", "process_name", "image", "user", "username",
+                "src_ip", "dst_ip", "ip", "remote_ip", "hash", "sha256", "md5"):
+        v = ev.get(key)
+        if v and isinstance(v, str) and len(v) >= 3:
+            ents.add(f"{key}:{v.lower()}")
+    # The executable/file name out of a path is a strong linker.
+    path = ev.get("path") or ev.get("locator") or ""
+    if path and "\\" in str(path):
+        ents.add("file:" + str(path).rsplit("\\", 1)[-1].lower())
+    return ents
+
+
+def group_findings_for_narrative(findings: list[dict],
+                                 batch_size: int) -> list[list[dict]]:
+    """
+    Build narrative batches that keep RELATED findings together instead of
+    slicing the flat list every `batch_size` items.
+
+    Findings are linked when they share any of:
+      - a folder / tool-name cluster (multi-file installs),
+      - a MITRE technique (the same attack step),
+      - a concrete entity (process, IP, user, file).
+
+    Linked findings form connected components (union-find); each component is
+    one coherent piece of the story. Components are then packed into batches no
+    larger than `batch_size`, keeping a component whole whenever it fits. A
+    component bigger than `batch_size` is split (rare; only huge installs), but
+    its pieces stay adjacent so the per-batch cluster hints still connect them.
+
+    Falls back to the naive fixed-size slicing if there's nothing to group.
+    """
+    if not findings:
+        return []
+
+    idx = {f["id"]: i for i, f in enumerate(findings)}
+    parent = list(range(len(findings)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    # 1) folder / tool clusters
+    for cluster in _cluster_findings_by_folder(findings):
+        ids = [idx[i] for i in cluster["finding_ids"] if i in idx]
+        for k in range(1, len(ids)):
+            union(ids[0], ids[k])
+
+    # 2) shared MITRE technique
+    by_mitre: dict = {}
+    by_entity: dict = {}
+    for f in findings:
+        i = idx[f["id"]]
+        mitre = f.get("mitre")
+        if mitre and mitre != "N/A":
+            by_mitre.setdefault(mitre, []).append(i)
+        for ent in _finding_entities(f):
+            by_entity.setdefault(ent, []).append(i)
+
+    for group in list(by_mitre.values()) + list(by_entity.values()):
+        for k in range(1, len(group)):
+            union(group[0], group[k])
+
+    # Collect components, preserving each finding's original order within.
+    components: dict = {}
+    for i, f in enumerate(findings):
+        components.setdefault(find(i), []).append(f)
+
+    # Order components by severity weight (critical first) then size, so the
+    # most important story leads and isn't buried in a late batch.
+    sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    def comp_key(comp):
+        best = min((sev_rank.get(str(x.get("severity", "")).lower(), 5) for x in comp), default=5)
+        return (best, -len(comp))
+    ordered = sorted(components.values(), key=comp_key)
+
+    # Pack components into batches without exceeding batch_size. A component
+    # larger than batch_size is chunked, but its chunks stay consecutive.
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    for comp in ordered:
+        if len(comp) > batch_size:
+            if current:
+                batches.append(current); current = []
+            for j in range(0, len(comp), batch_size):
+                batches.append(comp[j:j + batch_size])
+            continue
+        if len(current) + len(comp) > batch_size:
+            batches.append(current); current = []
+        current.extend(comp)
+    if current:
+        batches.append(current)
+
+    return batches or [findings[i:i + batch_size]
+                       for i in range(0, len(findings), batch_size)]
+
+
 
