@@ -172,6 +172,10 @@ def generate_report(incident: Incident) -> dict:
         "frequency_summary": incident.raw_artifacts.get("frequency_summary", {}),
         "pipeline_trace": incident.raw_artifacts.get("pipeline_trace", {}),
         "attack_narrative": incident.raw_artifacts.get("attack_narrative", {}),
+        "raw_artifacts": {
+            "narrative_regenerated_at": incident.raw_artifacts.get("narrative_regenerated_at"),
+            "narrative_regenerated_with": incident.raw_artifacts.get("narrative_regenerated_with"),
+        },
     }
 
     if a:

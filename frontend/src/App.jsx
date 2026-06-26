@@ -520,6 +520,30 @@ function ReportView({ incidentId, onBack }) {
   const [triageFilter, setTriageFilter] = useState("all");
   const [noteDraft, setNoteDraft] = useState({}); // finding_id -> in-progress note text
 
+  // ── Narrative regeneration ──
+  // IR is iterative: after cloud enrichment or triage, the narrative is stale.
+  // This re-runs it with the latest context. It's a full LLM pass, so it's slow.
+  const [regenBusy, setRegenBusy] = useState(false);
+  const [regenOpts, setRegenOpts] = useState({ respect_triage: true, include_enrichment: true });
+  const [regenOpen, setRegenOpen] = useState(false);
+
+  const regenerateNarrative = async () => {
+    if (regenBusy) return;
+    setRegenBusy(true);
+    try {
+      const form = new FormData();
+      form.append("respect_triage", regenOpts.respect_triage);
+      form.append("include_enrichment", regenOpts.include_enrichment);
+      const r = await fetch(`${API}/incidents/${incidentId}/regenerate-narrative`,
+        { method: "POST", body: form });
+      if (r.ok) {
+        loadReport();        // refresh with the new narrative
+        setRegenOpen(false);
+      }
+    } catch { /* ignore */ }
+    finally { setRegenBusy(false); }
+  };
+
   const markFinding = async (findingId, verdict) => {
     // Optimistic update; reconcile with server response.
     setTriage(prev => {
@@ -693,7 +717,43 @@ function ReportView({ incidentId, onBack }) {
       {/* Attack Narrative (LLM-generated) */}
       {report.attack_narrative?.attack_narrative && (
         <Card style={{ borderLeft: `3px solid ${C.accent}` }}>
-          <h3 style={{ margin: "0 0 10px", fontSize: 15, fontWeight: 500 }}>Attack narrative</h3>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <h3 style={{ margin: 0, fontSize: 15, fontWeight: 500 }}>Attack narrative</h3>
+            <div style={{ position: "relative" }}>
+              <button onClick={() => setRegenOpen(o => !o)} disabled={regenBusy}
+                style={{ fontSize: 11, padding: "5px 11px", borderRadius: 6, cursor: regenBusy ? "default" : "pointer",
+                         border: `1px solid ${C.border}`, background: C.surface2, color: regenBusy ? C.dim : C.muted }}>
+                {regenBusy ? "Regenerating… (a few min)" : "↻ Regenerate"}
+              </button>
+              {regenOpen && !regenBusy && (
+                <div style={{ position: "absolute", right: 0, top: "calc(100% + 4px)", zIndex: 10,
+                              width: 290, padding: 14, borderRadius: 8, background: C.surface,
+                              border: `1px solid ${C.border}`, boxShadow: "0 8px 24px rgba(0,0,0,.4)" }}>
+                  <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+                    Re-run the narrative with the latest context. Slow (full LLM pass).
+                  </div>
+                  {[["respect_triage", "Respect triage (drop false positives)"],
+                    ["include_enrichment", "Include cloud enrichment answers"]].map(([key, label]) => (
+                    <label key={key} style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 8, fontSize: 12, color: C.text, cursor: "pointer" }}>
+                      <input type="checkbox" checked={regenOpts[key]}
+                        onChange={e => setRegenOpts(o => ({ ...o, [key]: e.target.checked }))}
+                        style={{ marginTop: 2 }} />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                  <Btn variant="primary" onClick={regenerateNarrative}
+                    style={{ width: "100%", marginTop: 4, fontSize: 12 }}>
+                    Regenerate now
+                  </Btn>
+                </div>
+              )}
+            </div>
+          </div>
+          {report.raw_artifacts?.narrative_regenerated_at && (
+            <div style={{ fontSize: 10, color: C.dim, marginBottom: 8 }}>
+              Regenerated {new Date(report.raw_artifacts.narrative_regenerated_at).toLocaleString()}
+            </div>
+          )}
           <p style={{ margin: "0 0 12px", fontSize: 13, lineHeight: 1.7, color: C.muted, whiteSpace: "pre-wrap" }}>
             {report.attack_narrative.attack_narrative}
           </p>

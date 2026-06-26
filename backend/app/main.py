@@ -717,6 +717,33 @@ async def triage_finding(
     return {"finding_id": finding_id, "triage": incident.finding_triage.get(finding_id, {})}
 
 
+@app.post("/api/incidents/{incident_id}/regenerate-narrative")
+async def regenerate_narrative(
+    incident_id: str,
+    respect_triage: bool = Form(True),
+    include_enrichment: bool = Form(True),
+):
+    """Re-run the narrative with the latest triage + cloud enrichment.
+
+    respect_triage drops false-positive findings and annotates the rest with
+    the analyst's verdict; include_enrichment feeds Claude's gap answers into
+    the narrative context. Returns the refreshed narrative. This is a full LLM
+    pass, so it can take a few minutes on a local reasoning model.
+    """
+    incident = await orchestrator.regenerate_narrative(
+        incident_id,
+        respect_triage=respect_triage,
+        include_enrichment=include_enrichment,
+    )
+    if not incident:
+        raise HTTPException(404, "Incident not found")
+    return {
+        "incident_id": incident_id,
+        "attack_narrative": incident.raw_artifacts.get("attack_narrative", {}),
+        "regenerated_with": incident.raw_artifacts.get("narrative_regenerated_with", {}),
+    }
+
+
 @app.post("/api/incidents/{incident_id}/deanonymize")
 async def deanonymize_report(incident_id: str):
     result = orchestrator.deanonymize_report(incident_id)

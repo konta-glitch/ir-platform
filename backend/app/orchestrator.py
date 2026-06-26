@@ -378,6 +378,87 @@ class Orchestrator:
     def update_incident(self, incident_id: str, **kwargs) -> Incident | None:
         return self.incidents.update(incident_id, **kwargs)
 
+    async def regenerate_narrative(self, incident_id: str,
+                                   respect_triage: bool = True,
+                                   include_enrichment: bool = True) -> Incident | None:
+        """Re-run the narrative pass with the latest context.
+
+        IR is iterative: after cloud enrichment answers the knowledge gaps, or
+        after an analyst triages findings, the original narrative is stale. This
+        regenerates it from the stored findings, optionally:
+          - respect_triage: drop findings marked false_positive (and note the
+            benign ones) so the story reflects the analyst's calls.
+          - include_enrichment: prepend the cloud enrichment answers to the
+            context so the narrative can use what Claude found.
+        The detection findings themselves are never mutated — only the narrative
+        artifact is replaced.
+        """
+        incident = self.incidents.get(incident_id)
+        if not incident:
+            return None
+
+        findings = list(incident.raw_artifacts.get("detection_findings", []))
+        if not findings:
+            return incident
+
+        triage = incident.finding_triage or {}
+        if respect_triage and triage:
+            kept = []
+            dropped_fp = 0
+            for f in findings:
+                verdict = (triage.get(f.get("id", "")) or {}).get("verdict")
+                if verdict == "false_positive":
+                    dropped_fp += 1
+                    continue
+                # Annotate the analyst's call so the LLM can weight it.
+                if verdict:
+                    f = {**f, "analyst_verdict": verdict}
+                kept.append(f)
+            findings = kept
+            logger.info(
+                f"Regenerate narrative [{incident_id}]: {dropped_fp} false-positive "
+                f"finding(s) excluded, {len(findings)} kept"
+            )
+
+        # Build the context, optionally prepending cloud enrichment answers.
+        context_parts = []
+        if include_enrichment and incident.analysis and incident.analysis.cloud_enrichments:
+            enrich = "\n".join(f"- {e}" for e in incident.analysis.cloud_enrichments)
+            context_parts.append(
+                "Cloud analyst (Claude) answered these earlier knowledge gaps — "
+                "use them as corroborating intelligence:\n" + enrich
+            )
+        prior_context = incident.raw_artifacts.get("analyst_context", "")
+        if prior_context:
+            context_parts.append(prior_context)
+        context = "\n\n".join(context_parts)
+
+        attack_chains = (
+            incident.raw_artifacts.get("detection_summary", {}).get("attack_chains", [])
+        )
+
+        try:
+            narrative = await self.local.generate_narrative(
+                findings=findings,
+                attack_chains=attack_chains,
+                context=context,
+            )
+        except Exception as exc:
+            logger.warning(f"Narrative regeneration failed [{incident_id}]: {exc}")
+            return incident
+
+        if narrative:
+            arts = dict(incident.raw_artifacts)
+            arts["attack_narrative"] = narrative
+            arts["narrative_regenerated_at"] = datetime.utcnow().isoformat() + "Z"
+            arts["narrative_regenerated_with"] = {
+                "respect_triage": respect_triage,
+                "include_enrichment": include_enrichment,
+                "findings_used": len(findings),
+            }
+            self.incidents.update(incident_id, raw_artifacts=arts)
+        return self.incidents.get(incident_id)
+
     def triage_finding(self, incident_id: str, finding_id: str,
                        verdict: str | None = None,
                        note: str | None = None) -> Incident | None:
