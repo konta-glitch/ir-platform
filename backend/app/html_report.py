@@ -18,6 +18,7 @@ the responder.
 from __future__ import annotations
 
 import html
+from app.evidence_format import why_it_matters, evidence_fields
 import json
 
 
@@ -83,6 +84,11 @@ def generate_html(report: dict) -> str:
             "mitre": f.get("mitre", ""),
             "occurrences": f.get("occurrences", 1),
             "score": f.get("score", 0),
+            "why": why_it_matters(f),
+            "evidence": [
+                {"label": lbl, "value": val, "raw": raw}
+                for lbl, val, raw in evidence_fields(f)
+            ],
         }
         for f in findings
     ])
@@ -318,6 +324,30 @@ _TEMPLATE = """<!DOCTYPE html>
   .fmeta {{ font-family:var(--mono); font-size:12px; color:var(--ink-dim);
     margin-top:6px; display:flex; gap:14px; flex-wrap:wrap; }}
   .fdesc {{ font-size:13px; color:var(--ink); margin-top:8px; }}
+  /* why-it-matters: a quiet callout that explains the "so what" */
+  .fwhy {{ font-size:13px; color:var(--ink); margin-top:10px;
+    padding:8px 12px; border-radius:6px; background:var(--panel);
+    border-left:2px solid var(--sev); line-height:1.5; }}
+  .fwhy-l {{ display:block; font-family:var(--mono); font-size:10px;
+    text-transform:uppercase; letter-spacing:.06em; color:var(--ink-dim);
+    margin-bottom:3px; }}
+  /* evidence as a definition list: label left, value right, aligned */
+  .fev {{ margin:10px 0 0; display:grid; grid-template-columns:max-content 1fr;
+    gap:4px 14px; font-size:12.5px; }}
+  .fev dt {{ font-family:var(--mono); font-size:11px; color:var(--ink-dim);
+    text-transform:uppercase; letter-spacing:.04em; }}
+  .fev dd {{ margin:0; font-family:var(--mono); color:var(--accent);
+    word-break:break-all; }}
+  /* raw bytes behind a toggle */
+  .fraw {{ margin-top:8px; }}
+  .fraw-t {{ font-family:var(--mono); font-size:11px; cursor:pointer;
+    background:none; border:none; color:var(--ink-dim); padding:2px 0; }}
+  .fraw-t:hover {{ color:var(--ink); }}
+  .fraw-b {{ display:none; margin:6px 0 0; padding:10px; border-radius:6px;
+    background:var(--bg); border:1px solid var(--line); font-family:var(--mono);
+    font-size:11px; color:var(--ink-dim); white-space:pre-wrap;
+    word-break:break-all; max-height:200px; overflow:auto; }}
+  .fraw-b.open {{ display:block; }}
 
   /* tables / timeline / lists */
   table.grid {{ width:100%; border-collapse:collapse; font-size:13px; }}
@@ -437,10 +467,30 @@ _TEMPLATE = """<!DOCTYPE html>
       return (f.id+' '+f.title+' '+f.category+' '+f.mitre+' '+f.description).toLowerCase().includes(q);
     }});
     if (!rows.length) {{ host.innerHTML = '<p class="empty">No findings match this filter.</p>'; return; }}
-    host.innerHTML = rows.map(f => {{
+    host.innerHTML = rows.map((f, i) => {{
       const c = SEV[f.severity] || SEV.info;
       const occ = f.occurrences>1 ? `×${{f.occurrences}}` : '';
       const mitre = f.mitre ? `<span>MITRE ${{f.mitre}}</span>` : '';
+      const why = f.why ? `<div class="fwhy"><span class="fwhy-l">Why it matters</span>${{f.why}}</div>` : '';
+      // Evidence: normal fields inline, raw/binary behind a toggle.
+      const ev = f.evidence || [];
+      const normal = ev.filter(e => !e.raw);
+      const raw = ev.filter(e => e.raw);
+      let evHtml = '';
+      if (normal.length) {{
+        evHtml += '<dl class="fev">' + normal.map(e =>
+          `<dt>${{e.label}}</dt><dd>${{e.value}}</dd>`).join('') + '</dl>';
+      }}
+      if (raw.length) {{
+        const rid = 'raw'+i;
+        evHtml += raw.map(e =>
+          `<div class="fraw">
+             <button class="fraw-t" onclick="document.getElementById('${{rid}}').classList.toggle('open')">
+               ▸ ${{e.label}} (raw bytes)
+             </button>
+             <pre id="${{rid}}" class="fraw-b">${{e.value}}</pre>
+           </div>`).join('');
+      }}
       return `<div class="finding" style="--sev:${{c}}">
         <div class="finding-h">
           <span class="fid">${{f.id}}</span>
@@ -448,7 +498,9 @@ _TEMPLATE = """<!DOCTYPE html>
           <span class="fsev" style="--sev:${{c}}">${{f.severity}}</span>
         </div>
         <div class="fmeta"><span>${{f.category}}</span>${{mitre}}<span>${{occ}}</span><span>score ${{f.score}}</span></div>
+        ${{why}}
         <div class="fdesc">${{f.description||''}}</div>
+        ${{evHtml}}
       </div>`;
     }}).join('');
   }}
