@@ -21,6 +21,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.detection_engine import _cluster_findings_by_folder
+from app.detection.clustering import group_findings_for_narrative
 from app.lm_client import get_lm_client
 from app.models import (
     AnalysisResult,
@@ -228,11 +229,14 @@ class LocalAnalyzer:
                 f"(e.g. multi-file tool installs) — will be flagged to the LLM per batch"
             )
 
-        batches = [narrative_findings[i:i + batch_size]
-                   for i in range(0, len(narrative_findings), batch_size)]
+        # Build batches that keep related findings together (same folder/tool,
+        # MITRE technique, or entity) instead of slicing the flat list every
+        # batch_size items — so one attack's findings land in one batch and the
+        # model writes a coherent story instead of fragments.
+        batches = group_findings_for_narrative(narrative_findings, batch_size)
         logger.info(
             f"Narrative pass: {len(narrative_findings)} findings in {len(batches)} batch(es) "
-            f"of up to {batch_size}, concurrency={concurrency}"
+            f"of up to {batch_size} (grouped by relationship), concurrency={concurrency}"
         )
 
         sem = asyncio.Semaphore(concurrency)
@@ -270,7 +274,19 @@ class LocalAnalyzer:
             return {}
         if len(batch_results) == 1:
             return batch_results[0]
-        return self._merge_narrative_batches(batch_results)
+        merged = self._merge_narrative_batches(batch_results)
+        # Optionally fold the per-batch narratives into one coherent incident
+        # story. Synthesis is additive: on any failure we keep `merged` (the
+        # concatenated sections), so we never lose narrative to this step.
+        if settings.narrative_synthesize:
+            try:
+                synthesized = await self._synthesize_narrative(merged, attack_chains, context)
+                if synthesized:
+                    merged["attack_narrative"] = synthesized
+                    merged["synthesized"] = True
+            except Exception as e:
+                logger.warning(f"Narrative synthesis failed, keeping sections: {e}")
+        return merged
 
     async def _generate_narrative_batch(
         self, findings: list[dict], attack_chains: list[str], context: str,
@@ -382,6 +398,76 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
             logger.warning(f"Narrative generation failed for batch {batch_num}/{total_batches}: {e}")
             return {}
 
+    async def _synthesize_narrative(self, merged: dict, attack_chains: list[str],
+                                    context: str) -> str:
+        """Fold the per-batch narratives into one coherent incident story.
+
+        Input is the already-merged result (concatenated batch narratives +
+        key findings), NOT the raw findings — so this is a small "summarise the
+        summaries" call, fast even on a reasoning model. Returns the single
+        narrative string, or "" to signal the caller to keep the sections.
+        """
+        sections = merged.get("attack_narrative", "")
+        if not sections.strip():
+            return ""
+
+        # Give the synthesiser the key findings too, so it can anchor the story
+        # in specific finding ids rather than vague prose.
+        kf_lines = []
+        for kf in merged.get("key_findings", [])[:40]:
+            fid = kf.get("finding_id", "")
+            why = kf.get("why_it_matters", "")
+            if fid:
+                kf_lines.append(f"[{fid}] {why}")
+        kf_text = "\n".join(kf_lines) or "None highlighted."
+        chains_text = "\n".join(f"- {c}" for c in attack_chains) or "None detected."
+
+        system = (
+            "You are a senior incident responder writing the FINAL attack "
+            "narrative for an IR report. You are given several partial "
+            "narratives, each written from a different subset of the findings, "
+            "plus the key findings and detected attack chains. Your job is to "
+            "synthesise them into ONE coherent story of the whole incident.\n\n"
+            "Rules:\n"
+            "- Write 3-6 connected paragraphs telling a single chronological/"
+            "causal story, not a list of sections.\n"
+            "- MERGE activity that the partial narratives describe separately "
+            "but that is clearly the same attack (same tool, technique, host, "
+            "or entity across batches). This is the whole point.\n"
+            "- Reference finding ids in [brackets] so claims stay traceable.\n"
+            "- If the partials disagree or evidence is thin, say so rather than "
+            "inventing a clean story.\n"
+            "- Do NOT introduce findings or facts not present in the inputs.\n"
+            "- Output ONLY the narrative prose. No JSON, no headings, no preamble."
+        )
+        if get_settings().narrative_disable_thinking:
+            system += "\n/no_think"
+
+        user = (
+            f"Analyst context: {context or 'N/A'}\n\n"
+            f"Detected attack chains:\n{chains_text}\n\n"
+            f"Key findings:\n{kf_text}\n\n"
+            f"Partial narratives to synthesise:\n{sections}\n\n"
+            "Write the single coherent incident narrative now."
+        )
+
+        raw = await self._call_llm(
+            system, user, temperature=0.3,
+            timeout=get_settings().narrative_timeout,
+        )
+        # The synthesiser returns prose, not JSON — but a reasoning model may
+        # still wrap it in a <think> block, so strip that the same way.
+        text = raw.strip()
+        if "<think>" in text:
+            if "</think>" in text:
+                text = text.split("</think>", 1)[1].strip()
+            else:
+                text = text.split("<think>", 1)[1].strip()
+        # Guard against the model echoing JSON despite instructions.
+        if text.startswith("{") or text.startswith("```"):
+            return ""
+        return text
+
     @staticmethod
     def _merge_narrative_batches(batch_results: list[dict]) -> dict:
         """
@@ -458,7 +544,26 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
                 candidate = match.group() if match else None
             if candidate:
                 try:
-                    return json.loads(candidate)
+                    parsed = json.loads(candidate)
+                    # Guard against the balanced extractor having grabbed a
+                    # NESTED object (e.g. the first {...} inside an "iocs":[...]
+                    # array) that happens to be valid JSON but is only a
+                    # fragment of the real answer. If repairing the full text
+                    # yields a strictly richer object, prefer that. This is the
+                    # 0-IOC/0-MITRE regression: a valid inner fragment was being
+                    # returned as the whole analysis.
+                    if isinstance(parsed, dict):
+                        try:
+                            from json_repair import repair_json
+                            full = repair_json(cleaned, return_objects=True)
+                            if isinstance(full, dict) and len(full) > len(parsed):
+                                logger.info(
+                                    f"JSON: full-text repair richer than extracted "
+                                    f"fragment ({len(full)} vs {len(parsed)} keys)")
+                                return full
+                        except Exception:
+                            pass
+                    return parsed
                 except json.JSONDecodeError as e2:
                     # Smaller/weaker local models sometimes emit a raw
                     # newline/tab/control character inside a JSON string
@@ -482,23 +587,37 @@ isolated low-confidence hits, and calibrate your confidence to the actual eviden
                             pass
 
             # Last resort: json-repair fixes structural mistakes the model
-            # sometimes makes (a missing ':' or ',', an unclosed quote, a
-            # trailing comma) that none of the above handles — exactly the
-            # "Expecting ':' delimiter" failures DeepSeek-R1 produces on the
-            # occasional narrative batch. Tried last because it's the most
-            # permissive (and slowest) path; strict json.loads wins whenever the
-            # output is already valid. Runs on the extracted candidate when we
-            # have one, else the cleaned text.
-            repair_input = candidate if candidate else cleaned
+            # sometimes makes (a missing ':'/',', an unclosed quote, a trailing
+            # comma, a truncated tail) that none of the above handles. Tried
+            # last because it's the most permissive (and slowest) path; strict
+            # json.loads wins whenever the output is already valid.
+            #
+            # Try it on BOTH the brace-extracted candidate AND the full cleaned
+            # text, then keep whichever yields the richer object. The balanced
+            # extractor can stop at the first complete-looking '}' and hand
+            # json-repair a fragment that parses but is missing everything after
+            # it (this is what produced the empty 0-IOC/0-MITRE result); the
+            # full text often repairs to the complete object.
             try:
                 from json_repair import repair_json
-                repaired = repair_json(repair_input, return_objects=True)
-                if isinstance(repaired, dict) and repaired:
-                    logger.info("JSON recovered via json-repair")
-                    return repaired
+                best: dict = {}
+                for source in (candidate, cleaned):
+                    if not source:
+                        continue
+                    try:
+                        cand = repair_json(source, return_objects=True)
+                    except Exception:
+                        continue
+                    if isinstance(cand, dict) and len(cand) > len(best):
+                        best = cand
+                if best:
+                    logger.info(
+                        f"JSON recovered via json-repair ({len(best)} keys)")
+                    return best
             except Exception as e3:
                 logger.debug(f"json-repair could not recover output: {e3}")
 
+            logger.warning("JSON unrecoverable — returning empty result")
             return {}
 
     @staticmethod

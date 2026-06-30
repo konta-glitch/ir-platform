@@ -453,21 +453,27 @@ def generate_markdown(incident: Incident) -> str:
                 lines.append(f"#### [{f['id']}] {f['title']}{occ_str}")
                 lines.append(f"- **Category:** {f['category']}")
                 lines.append(f"- **MITRE:** {f.get('mitre', 'N/A')}")
+                lines.append(f"- **Why it matters:** {why_it_matters(f)}")
                 lines.append(f"- **Description:** {f['description']}")
                 lines.append(f"- **Evidence location:** `{locator}`")
                 if occ > 1 and f.get("occurrence_locators"):
                     lines.append(f"- **Other occurrences:** {', '.join(f['occurrence_locators'][:5])}"
                                  + (" ..." if occ > 6 else ""))
-                # Evidence detail (skip internal fields)
-                ev_lines = []
-                for k, v in ev.items():
-                    if k not in ("row_index", "locator", "source_file") and v:
-                        ev_lines.append(f"  - `{k}`: {str(v)[:200]}")
-                if ev.get("source_file"):
-                    ev_lines.insert(0, f"  - `file`: {ev['source_file']}")
-                if ev_lines:
+                # Structured evidence: meaningful fields as a list, long/binary
+                # values (matched_strings) in a fenced block so they don't wreck
+                # the layout but stay available.
+                fields = evidence_fields(f)
+                normal = [(lbl, val) for lbl, val, raw in fields if not raw]
+                raw = [(lbl, val) for lbl, val, raw in fields if raw]
+                if normal:
                     lines.append("- **Evidence:**")
-                    lines.extend(ev_lines)
+                    for lbl, val in normal:
+                        lines.append(f"  - **{lbl}:** {val[:300]}")
+                for lbl, val in raw:
+                    lines.append(f"- **{lbl}** (raw):")
+                    lines.append("  ```")
+                    lines.append("  " + val[:500].replace("\n", "\n  "))
+                    lines.append("  ```")
                 lines.append("")
 
     # Data Coverage — IR completeness proof

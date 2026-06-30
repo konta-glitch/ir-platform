@@ -56,3 +56,14 @@ def test_valid_json_still_uses_fast_path():
 def test_pure_garbage_returns_empty_dict():
     a = _a()
     assert a._parse_json("this is not json at all, just prose") == {}
+
+
+def test_recovers_richer_object_from_full_text():
+    """When the balanced extractor stops early, json-repair on the full text
+    should recover the complete object (the 0-IOC/0-MITRE regression)."""
+    a = LocalAnalyzer.__new__(LocalAnalyzer)
+    # A truncated-then-continued shape where a naive extract grabs only {"a":1}
+    raw = '{"summary": "x", "iocs": [{"type": "file"}], "mitre": [{"id": "T1"}],}'
+    out = a._parse_json(raw)
+    # Must keep the rich keys, not collapse to a fragment.
+    assert "summary" in out and "iocs" in out and "mitre" in out
