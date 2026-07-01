@@ -10,6 +10,7 @@ Outputs:
 
 from datetime import datetime
 from app.models import Incident, Severity
+from app.evidence_format import why_it_matters, evidence_fields
 
 
 SEVERITY_LABELS = {
