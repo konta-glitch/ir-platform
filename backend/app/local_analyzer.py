@@ -157,20 +157,27 @@ class LocalAnalyzer:
 
     async def chat_messages(self, messages: list[dict],
                             temperature: float = 0.2,
-                            max_tokens: int = 1500,
+                            max_tokens: int = 0,
                             tools: list[dict] | None = None):
         """Multi-turn chat — used by the investigation agent's reasoning loop.
 
         With `tools`, returns the full assistant message dict (may contain
         tool_calls) for native function calling. Without, returns text.
+
+        max_tokens defaults to the configured llm_max_tokens: a reasoning model
+        (DeepSeek-R1) can burn a small budget entirely on its <think> block and
+        return empty content (finish_reason=length), which showed up as the
+        agent producing no answer. A generous budget leaves room for the actual
+        tool call / answer after any reasoning.
         """
         from app.config import get_settings
+        settings = get_settings()
         return await self.lm.chat(
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens or settings.llm_max_tokens,
             tools=tools,
-            timeout=get_settings().llm_timeout,
+            timeout=settings.llm_timeout,
         )
 
     async def generate_narrative(self, findings: list[dict],

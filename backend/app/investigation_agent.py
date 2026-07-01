@@ -274,7 +274,9 @@ When you have enough evidence to conclude:
 
 Investigate methodically: start broad (list_artifacts, get_findings), then pivot on
 the most suspicious leads (search for IOCs, inspect findings, check process trees,
-verify rarity). Corroborate before concluding. Be specific and cite finding IDs."""
+verify rarity). Corroborate before concluding. Be specific and cite finding IDs.
+
+/no_think"""
 
 
 CHAT_SYSTEM_PROMPT = """You are an expert incident-response analyst in an interactive session.
@@ -297,7 +299,9 @@ Guidelines:
 - Keep answers concise and factual. Cite finding IDs (F0001) and source locations.
 - Remember the conversation — the analyst may refer back to earlier answers ("that IP",
   "the second finding"). Use context from previous turns.
-- If the data doesn't contain the answer, say so plainly rather than guessing."""
+- If the data doesn't contain the answer, say so plainly rather than guessing.
+
+/no_think"""
 
 
 class InvestigationAgent:
@@ -352,8 +356,14 @@ class InvestigationAgent:
                     "thought": (msg.get("content") or "").strip()[:200],
                     "_assistant_msg": msg, "_tool_call_id": call.get("id")}
         # No tool call — the model answered in text. Treat content as a
-        # natural-language answer/conclusion.
-        return {"action": "answer", "answer": (msg.get("content") or "").strip(),
+        # natural-language answer/conclusion. If the content is empty (e.g. a
+        # reasoning model burned the whole budget on <think>), signal a retry
+        # rather than returning a blank answer to the user.
+        content = (msg.get("content") or "").strip()
+        if not content:
+            self._native_failed = True
+            return None
+        return {"action": "answer", "answer": content,
                 "_assistant_msg": msg}
 
     def _dispatch(self, action: str, args: dict) -> dict:
