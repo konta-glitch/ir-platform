@@ -388,21 +388,40 @@ class InvestigationAgent:
 
     @staticmethod
     def _parse_json(text: str) -> dict | None:
-        """Extract a JSON object from the LLM response."""
+        """Extract a JSON object from the LLM response.
+
+        Reasoning models sometimes emit JSON with the spaces stripped
+        ("TofindIP...") or minor structural slips, so after strict json we fall
+        back to json-repair before giving up.
+        """
         if not text:
             return None
         # Strip code fences
         text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-        # Find the first balanced JSON object
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if match:
+            pass
+        # First balanced object
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        candidate = match.group(0) if match else text
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        # Last resort: json-repair on both the candidate and the full text,
+        # take whichever yields a dict with an "action".
+        try:
+            from json_repair import repair_json
+            for src in (candidate, text):
                 try:
-                    return json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    return None
+                    obj = repair_json(src, return_objects=True)
+                    if isinstance(obj, dict) and obj.get("action"):
+                        return obj
+                except Exception:
+                    continue
+        except Exception:
+            pass
         return None
 
     async def ask(self, question: str, history: list[dict] | None = None,
@@ -445,7 +464,22 @@ class InvestigationAgent:
                     break
                 decision = self._parse_json(raw)
                 if not decision:
-                    answer = raw.strip()[:1500]
+                    # Parsing failed. If the raw text is clearly the internal
+                    # tool-call protocol leaking (starts with '{' / mentions
+                    # "action"), don't dump that JSON at the analyst — retry the
+                    # turn with a nudge instead. Only surface genuine prose.
+                    stripped = raw.strip()
+                    looks_like_protocol = stripped.startswith("{") or '"action"' in stripped
+                    if looks_like_protocol and step < max_steps - 1:
+                        history.append({"role": "assistant", "content": stripped[:400]})
+                        history.append({"role": "user", "content":
+                            "That wasn't valid JSON. Reply with ONLY a single JSON "
+                            "object per the protocol — either an action call or "
+                            "an \"answer\"."})
+                        continue
+                    answer = stripped[:1500] if not looks_like_protocol else (
+                        "I had trouble forming a structured answer. Please rephrase "
+                        "the question or ask about a specific finding.")
                     history.append({"role": "assistant", "content": raw[:800]})
                     break
 
